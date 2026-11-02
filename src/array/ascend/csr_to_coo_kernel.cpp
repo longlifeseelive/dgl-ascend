@@ -1,5 +1,5 @@
 #include "kernel_operator.h"
-
+#include <type_traits>
 using namespace AscendC;
 
 // CSR -> COO row array.
@@ -44,9 +44,26 @@ class KernelCsrToCOO {
     for (uint32_t row = start_row; row < end_row; row++) {
       const IdxT seg_start = indptr_p_[row];
       const IdxT seg_end = indptr_p_[row + 1];
-      for (IdxT pos = seg_start; pos < seg_end; pos++) {
-        staging.SetValue(staged, static_cast<IdxT>(row));
-        ++staged;
+
+      uint32_t remaining = static_cast<uint32_t>(seg_end - seg_start);
+
+      while(remaining > 0) {
+        const uint32_t space = kFlushElems - staged;
+        const uint32_t take = remaining < space ? remaining : space;
+
+        if constexpr (std::is_same<IdxT, int32_t>::value){
+          // int32: vectorized fill
+          FillVectorInt32(staging, staged, take, static_cast<int32_t>(row));
+        } else {
+          // int64: keep origin scalar path
+          for (uint32_t i = 0; i < take; ++i) {
+            staging.SetValue(staged + i, static_cast<IdxT>(row));
+          }
+        }
+
+        staged += take;
+        remaining -= take;
+
         if (staged == kFlushElems) {
           FlushOut(staging, out_off, staged);
           out_off += staged;
@@ -60,9 +77,23 @@ class KernelCsrToCOO {
  private:
   __aicore__ inline void FlushOut(LocalTensor<IdxT>& staging,
                                   uint32_t out_index, uint32_t count) {
+
+    if constexpr (std::is_same<IdxT, int32_t>::value) {
+      TQueSync<PIPE_V, PIPE_MTE3> sync;
+      sync.SetFlag(0);
+      sync.WaitFlag(0);
+    }
+
+
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(IdxT)), 0, 0,
                          0};
     DataCopyPad(ret_row_gm_[out_index], staging, cp);
+
+    if constexpr (std::is_same<IdxT, int32_t>::value) {
+      TQueSync<PIPE_MTE3, PIPE_V> sync;
+      sync.SetFlag(0);
+      sync.WaitFlag(0);
+    }
   }
 
   static constexpr uint32_t kFlushElems = 1024;
@@ -72,6 +103,31 @@ class KernelCsrToCOO {
   uint32_t num_rows_;
   uint32_t nnz_;
   TBuf<TPosition::VECCALC> row_buf_;
+
+  __aicore__ inline void FillVectorInt32(const LocalTensor<int32_t>& staging, uint32_t offset, uint32_t count, int32_t row) {
+    constexpr uint32_t kVecElems = 64;
+
+    while (count > 0) {
+      const uint32_t aligned = offset & ~63U;
+      const uint32_t lane = offset - aligned;
+      const uint32_t capacity = kVecElems - lane;
+      const uint32_t n = count < capacity ? count : capacity;
+      uint64_t bits;
+
+      if (n == 64 ){
+        bits = ~uint64_t(0);
+      } else {
+        bits = ((uint64_t(1) << n) - 1ULL) << lane;
+      }
+
+      uint64_t mask[1] = {bits};
+
+      Duplicate<int32_t>(staging[aligned], row, mask, 1, 1, 8);
+
+      offset += n;
+      count -= n;
+    }
+  }
 };
 
 extern "C" __global__ __aicore__ void csr_to_coo_int32(
