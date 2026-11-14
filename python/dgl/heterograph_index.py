@@ -15,6 +15,29 @@ from .base import dgl_warning, DGLError
 from .graph_index import from_coo
 
 
+_ascend_csr_graph_op = None
+
+
+def _csr_to_coo_npu_graph(graph, etype, materialize, transpose=False):
+    """Route only NPU CSR conversion; leave the shared DGL FFI unchanged."""
+    global _ascend_csr_graph_op
+    if F.backend_name != "pytorch" or "torch_npu" not in sys.modules:
+        return None
+    if _ascend_csr_graph_op is None:
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return None
+        try:
+            _ascend_csr_graph_op = torch.ops.dgl_ascend._csr_to_coo_graph
+        except AttributeError:
+            _ascend_csr_graph_op = False
+    if _ascend_csr_graph_op is False:
+        return None
+    tensors, rows, cols = _ascend_csr_graph_op(
+        graph.handle.value, int(etype), materialize, transpose)
+    return (tensors, rows, cols) if tensors else None
+
+
 @register_object("graph.HeteroGraph")
 class HeteroGraphIndex(ObjectBase):
     """HeteroGraph index object.
@@ -693,6 +716,10 @@ class HeteroGraphIndex(ObjectBase):
                 "Expect order to be one of None, 'srcdst', 'eid', "
                 "got {}".format(order)
             )
+        if not order:
+            converted = _csr_to_coo_npu_graph(self, etype, False)
+            if converted is not None:
+                return tuple(converted[0])
         edge_array = _CAPI_DGLHeteroEdges(self, int(etype), order)
         src = F.from_dgl_nd(edge_array(0))
         dst = F.from_dgl_nd(edge_array(1))
@@ -843,6 +870,12 @@ class HeteroGraphIndex(ObjectBase):
                 'Expect bool value for "transpose" arg,'
                 " but got %s." % (type(transpose))
             )
+
+        if fmt == "coo":
+            converted = _csr_to_coo_npu_graph(self, etype, True, transpose)
+            if converted is not None:
+                tensors, nrows, ncols = converted
+                return nrows, ncols, tensors[0], tensors[1]
 
         rst = _CAPI_DGLHeteroGetAdj(self, int(etype), transpose, fmt)
         srctype, dsttype = self.metagraph.find_edge(etype)

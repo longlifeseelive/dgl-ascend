@@ -5,8 +5,8 @@ using namespace AscendC;
 // Sparse graphs use row tiles to avoid per-core binary searches. Few-row and
 // high-average-degree graphs use weighted row/edge partitions so a single
 // high-degree row can span vector cores. All output ranges are disjoint.
-// Row pointers are read in UB batches; only the initial upper_bound uses GM
-// scalar loads. All output stores use MTE3, including the unaligned final tail.
+// Row pointers are read in UB batches; GM upper_bounds also skip long empty
+// stretches. All output stores use MTE3, including the unaligned final tail.
 template <typename IdxT>
 class KernelCsrToCOO {
  public:
@@ -72,6 +72,37 @@ class KernelCsrToCOO {
       }
       const uint64_t row_end =
           static_cast<uint64_t>(ptrs.GetValue(row + 1 - ptr_base));
+      if (row_end <= pos) {
+        // Skip empty rows in the resident pointer tile. If the whole tail is
+        // empty, upper_bound in GM jumps directly to the next occupied row;
+        // do not scan arbitrarily long zero-degree stretches one row at a time.
+        uint32_t lo = row + 1 - ptr_base;
+        uint32_t hi = ptr_count - 1;
+        if (static_cast<uint64_t>(ptrs.GetValue(hi)) > pos) {
+          while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            if (static_cast<uint64_t>(ptrs.GetValue(mid)) <= pos)
+              lo = mid + 1;
+            else
+              hi = mid;
+          }
+          row = ptr_base + lo - 1;
+        } else {
+          lo = ptr_base + ptr_count - 1;
+          hi = num_rows_;
+          while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            if (static_cast<uint64_t>(indptr_p_[mid + 1]) <= pos)
+              lo = mid + 1;
+            else
+              hi = mid;
+          }
+          row = lo;
+          ptr_base = row;
+          ptr_count = LoadPointers(ptr_base);
+        }
+        continue;
+      }
       const uint64_t stop = row_end < end ? row_end : end;
       while (pos < stop) {
         const uint32_t space = kFlushElems - staged;
@@ -208,10 +239,13 @@ class KernelCsrToCOOOrder {
     pipe->InitBuffer(order_buf_, kTile * sizeof(IdxT));
     pipe->InitBuffer(out_row_buf_, kTile * sizeof(IdxT));
     pipe->InitBuffer(out_col_buf_, kTile * sizeof(IdxT));
+    pipe->InitBuffer(store_meta_buf_, kPendingStores * 2 * sizeof(IdxT));
   }
 
   __aicore__ inline void Process() {
     constexpr uint32_t kAlign = 32 / sizeof(IdxT);
+    static_assert(kPendingStores * 32 <= kTile * sizeof(IdxT),
+                  "Pending DMA slots must fit in each output buffer");
     const uint64_t chunk =
         ((nnz_ + GetBlockNum() - 1) / GetBlockNum() + kAlign - 1) /
         kAlign * kAlign;
@@ -255,7 +289,24 @@ class KernelCsrToCOOOrder {
         }
         if (direction == 1 && cursor % kAlign == 0) {
           Store(static_cast<uint64_t>(first), rows[cursor], cols[cursor], run);
+        } else if (run <= kAlign) {
+          // Give each pending short run its own aligned UB slot. The slots
+          // remain immutable until all DMA reads complete, allowing one pair
+          // of S/MTE3 barriers per batch rather than per random edge.
+          const uint32_t slot = pending_ * kAlign;
+          for (uint32_t i = 0; i < run; ++i) {
+            const uint32_t src = direction == -1
+                                     ? cursor + run - 1 - i : cursor + i;
+            out_rows.SetValue(slot + i, rows.GetValue(src));
+            out_cols.SetValue(slot + i, cols.GetValue(src));
+          }
+          auto metadata = store_meta_buf_.Get<IdxT>();
+          const IdxT target = direction == -1 ? first - (run - 1) : first;
+          metadata.SetValue(pending_ * 2, target);
+          metadata.SetValue(pending_ * 2 + 1, static_cast<IdxT>(run));
+          if (++pending_ == kPendingStores) FlushPending();
         } else {
+          FlushPending();
           for (uint32_t i = 0; i < run; ++i) {
             const uint32_t src = direction == -1
                                      ? cursor + run - 1 - i : cursor + i;
@@ -267,10 +318,32 @@ class KernelCsrToCOOOrder {
         }
         cursor += run;
       }
+      FlushPending();
     }
   }
 
  private:
+  __aicore__ inline void FlushPending() {
+    if (pending_ == 0) return;
+    constexpr uint32_t kAlign = 32 / sizeof(IdxT);
+    auto rows = out_row_buf_.Get<IdxT>();
+    auto cols = out_col_buf_.Get<IdxT>();
+    auto metadata = store_meta_buf_.Get<IdxT>();
+    SetFlag<HardEvent::S_MTE3>(0);
+    WaitFlag<HardEvent::S_MTE3>(0);
+    for (uint32_t i = 0; i < pending_; ++i) {
+      const uint64_t offset = static_cast<uint64_t>(metadata.GetValue(i * 2));
+      const uint32_t count = static_cast<uint32_t>(metadata.GetValue(i * 2 + 1));
+      DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(IdxT)),
+                           0, 0, 0};
+      DataCopyPad(out_row_gm_[offset], rows[i * kAlign], cp);
+      DataCopyPad(out_col_gm_[offset], cols[i * kAlign], cp);
+    }
+    SetFlag<HardEvent::MTE3_S>(0);
+    WaitFlag<HardEvent::MTE3_S>(0);
+    pending_ = 0;
+  }
+
   __aicore__ inline void Store(uint64_t offset,
                               const LocalTensor<IdxT>& rows,
                               const LocalTensor<IdxT>& cols, uint32_t count) {
@@ -285,10 +358,13 @@ class KernelCsrToCOOOrder {
   }
 
   static constexpr uint32_t kTile = 2048;
+  static constexpr uint32_t kPendingStores = 64;
   uint64_t nnz_;
+  uint32_t pending_ = 0;
   GlobalTensor<IdxT> row_gm_, col_gm_, order_gm_, out_row_gm_, out_col_gm_;
   TBuf<TPosition::VECCALC> row_buf_, col_buf_, order_buf_;
   TBuf<TPosition::VECCALC> out_row_buf_, out_col_buf_;
+  TBuf<TPosition::VECCALC> store_meta_buf_;
 };
 
 extern "C" __global__ __aicore__ void csr_to_coo_order_int32(
