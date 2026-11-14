@@ -772,23 +772,14 @@ CSRMatrix CSRTranspose(CSRMatrix csr) {
 COOMatrix CSRToCOO(CSRMatrix csr, bool data_as_order) {
   COOMatrix ret;
   if (data_as_order) {
-    if (csr.indptr->ctx.device_type == kDGLAscend) {
-      DGLContext cpu_ctx{kDGLCPU, 0};
-      auto indptr_cpu = csr.indptr.CopyTo(cpu_ctx);
-      auto indices_cpu = csr.indices.CopyTo(cpu_ctx);
-      auto data_cpu = csr.data.CopyTo(cpu_ctx);
-      CSRMatrix csr_cpu{csr.num_rows, csr.num_cols,
-                         indptr_cpu, indices_cpu, data_cpu};
-      ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
-        ret = impl::CSRToCOODataAsOrder<kDGLCPU, IdType>(csr_cpu);
-      });
 #ifdef DGL_USE_ASCEND
-      // Copy the CPU-computed COO back to the Ascend device so the graph
-      // materialized from it keeps the NPU context. CopyTo uses the sync
-      // aclrtMemcpy path, so no extra sync is needed.
-      ret = ret.CopyTo(csr.indptr->ctx);
+    if (csr.indptr->ctx.device_type == kDGLAscend) {
+      ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
+        ret = impl::CSRToCOODataAsOrder<kDGLAscend, IdType>(csr);
+      });
+    } else
 #endif
-    } else {
+    {
       ATEN_XPU_SWITCH_CUDA(
           csr.indptr->ctx.device_type, XPU, "CSRToCOODataAsOrder", {
             ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
