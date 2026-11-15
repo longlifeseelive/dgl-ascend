@@ -982,7 +982,10 @@ def _csrmask(A, A_weights, B):
             except AttributeError:
                 lookup = None
             if lookup is not None:
-                result = lookup(A.handle.value, A_weights, B.handle.value)
+                try:
+                    result = lookup(A.handle.value, A_weights, B.handle.value)
+                except RuntimeError as exc:
+                    raise DGLError(str(exc)) from exc
                 if result is not None:
                     return result
     return F.from_dgl_nd(_CAPI_DGLCSRMask(A, F.to_dgl_nd(A_weights), B))

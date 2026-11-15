@@ -22,7 +22,7 @@ class KernelLookup {
  public:
   __aicore__ inline void Init(
       GM_ADDR ptr, GM_ADDR idx, GM_ADDR data, GM_ADDR rows, GM_ADDR cols,
-      GM_ADDR weights, GM_ADDR out, uint32_t num_rows, uint64_t num_cols,
+      GM_ADDR weights, GM_ADDR out, GM_ADDR status, uint32_t num_rows, uint64_t num_cols,
       uint64_t count, uint32_t row_stride, uint32_t col_stride,
       uint32_t has_data, uint32_t sorted, uint64_t filler, TPipe* pipe) {
     ptr_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(ptr));
@@ -32,6 +32,8 @@ class KernelLookup {
     cols_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(cols));
     weights_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ OutT*>(weights));
     out_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ OutT*>(out));
+    status_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(status));
+    pipe->InitBuffer(status_buf_, 32);
     num_rows_ = num_rows; num_cols_ = num_cols; count_ = count;
     row_stride_ = row_stride; col_stride_ = col_stride;
     has_data_ = has_data; sorted_ = sorted; filler_ = static_cast<OutT>(filler);
@@ -58,7 +60,8 @@ class KernelLookup {
   }
 
   __aicore__ inline void Process() {
-    if (begin_ >= end_) return;
+    if (begin_ >= end_) { WriteStatus(0); return; }
+    uint64_t error = 0;
     auto pointers = ptr_buf_.Get<IdT>();
     auto rows = rows_buf_.Get<IdT>();
     auto cols = cols_buf_.Get<IdT>();
@@ -89,10 +92,16 @@ class KernelLookup {
         SetFlag<HardEvent::S_MTE2>(0); WaitFlag<HardEvent::S_MTE2>(0);
         for (uint32_t i = 0; i < qn; ++i) {
           const IdT r = rows.GetValue(row_stride_ ? batch + i : 0);
+          const IdT c = cols.GetValue(col_stride_ ? batch + i : 0);
           IdT start = 0, stop = 0;
-          // Valid IDs are the public contract. Guard malformed device input
-          // here to prevent an out-of-range device memory access.
-          if (r >= 0 && static_cast<uint64_t>(r) < num_rows_) {
+          const bool valid_row = r >= 0 && static_cast<uint64_t>(r) < num_rows_;
+          const bool valid_col = c >= 0 && static_cast<uint64_t>(c) < num_cols_;
+          if ((!valid_row || !valid_col) && !error) {
+            // Preserve row-before-column checking; read the offending ID on
+            // the host only after an error has been reported by the NPU.
+            error = 2 * (base + batch + i) + (valid_row ? 2 : 1);
+          }
+          if (valid_row && valid_col) {
             start = cache_ptr_ ? pointers.GetValue(r) : ptr_gm_.GetValue(r);
             stop = cache_ptr_ ? pointers.GetValue(r + 1) : ptr_gm_.GetValue(r + 1);
           }
@@ -205,8 +214,17 @@ class KernelLookup {
       DataCopyPad(out_gm_[base], result, cp);
       SetFlag<HardEvent::MTE3_S>(0); WaitFlag<HardEvent::MTE3_S>(0);
     }
+    WriteStatus(error);
   }
  private:
+  __aicore__ inline void WriteStatus(uint64_t error) {
+    auto status = status_buf_.Get<uint64_t>();
+    status.SetValue(0, error);
+    SetFlag<HardEvent::S_MTE3>(0); WaitFlag<HardEvent::S_MTE3>(0);
+    DataCopyExtParams cp{1, 8, 0, 0, 0};
+    DataCopyPad(status_gm_[GetBlockIdx()], status, cp);
+    SetFlag<HardEvent::MTE3_S>(0); WaitFlag<HardEvent::MTE3_S>(0);
+  }
   template <typename T>
   __aicore__ inline void FillValues(LocalTensor<T> buffer) {
     constexpr uint32_t nwords = kBatch * 32 / 4;
@@ -268,6 +286,8 @@ class KernelLookup {
   }
   GlobalTensor<IdT> ptr_gm_, idx_gm_, data_gm_, rows_gm_, cols_gm_;
   GlobalTensor<OutT> weights_gm_, out_gm_;
+  GlobalTensor<uint64_t> status_gm_;
+  TBuf<TPosition::VECCALC> status_buf_;
   TBuf<TPosition::VECCALC> ptr_buf_, rows_buf_, cols_buf_, out_buf_, row_buf_;
   TBuf<TPosition::VECCALC> start_buf_, end_buf_;
   TBuf<TPosition::VECCALC> mask_lo_buf_, mask_hi_buf_;
@@ -285,12 +305,14 @@ class KernelLookup {
 #define GET_DATA_ENTRY(NAME, ID, OUT, WEIGHTED)                               \
 extern "C" __global__ __aicore__ void NAME(                                  \
     GM_ADDR ptr, GM_ADDR idx, GM_ADDR data, GM_ADDR rows, GM_ADDR cols,         \
-    GM_ADDR weights, GM_ADDR out, uint32_t num_rows, uint64_t num_cols,        \
+    GM_ADDR weights, GM_ADDR out, GM_ADDR status,                            \
+    uint32_t num_rows, uint64_t num_cols,                                    \
     uint64_t count, uint32_t row_stride, uint32_t col_stride,                  \
     uint32_t has_data, uint32_t sorted, uint64_t filler) {                     \
   TPipe pipe;                                                                \
   KernelLookup<ID, OUT, WEIGHTED> op;                                         \
-  op.Init(ptr, idx, data, rows, cols, weights, out, num_rows, num_cols, count,   \
+  op.Init(ptr, idx, data, rows, cols, weights, out, status,                    \
+          num_rows, num_cols, count,                                        \
           row_stride, col_stride, has_data, sorted, filler, &pipe);            \
   op.Process();                                                              \
 }

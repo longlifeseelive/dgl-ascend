@@ -161,6 +161,65 @@ def exact_check(actual, expected):
 
 
 class TestCSRGetDataNPU(unittest.TestCase):
+    def test_invalid_indices_and_broadcast_errors(self):
+        packed=dgl._ffi.function.get_global_func("ascend._CAPI_DGLCSRGetData")
+        for dtype in (torch.int32,torch.int64):
+            p=torch.tensor([0,2,3,4],dtype=dtype)
+            data=torch.tensor([3,1,0,2],dtype=dtype)
+            invalid=[(-1,1),(3,1),(0,-1),(0,4),(-1,-1)]
+            if dtype==torch.int64:invalid.extend(((1<<40,1),(0,1<<40)))
+            for sorted_cols in (False,True):
+                j=torch.tensor([1,2,0,3] if sorted_cols else [2,1,0,3],dtype=dtype)
+                for weighted,wtype in ((False,torch.float32),(True,torch.float32),(True,torch.float64)):
+                    for row,col in invalid:
+                        expected="Invalid row index" if row<0 or row>=3 else "Invalid col index"
+                        for device in ("cpu","npu:0"):
+                            with self.subTest(dtype=dtype,sorted=sorted_cols,weighted=weighted,
+                                              weight_dtype=wtype,row=row,col=col,device=device):
+                                matrix=dgl.ndarray.SparseMatrix.__new__(dgl.ndarray.SparseMatrix)
+                                matrix.__setstate__((2,3,4,tuple(x.to(device) for x in (p,j,data)),[sorted_cols]))
+                                r=torch.tensor([row],dtype=dtype,device=device)
+                                c=torch.tensor([col],dtype=dtype,device=device)
+                                w=torch.arange(4,dtype=wtype,device=device)
+                                with self.assertRaisesRegex(dgl.DGLError,expected):
+                                    packed(matrix,dgl.backend.to_dgl_nd(r),dgl.backend.to_dgl_nd(c),
+                                           not weighted,dgl.backend.to_dgl_nd(w),2.5)
+            cpu=dgl.heterograph({ETYPE:("csr",(p,j,data))},
+                                num_nodes_dict={"_U":3,"_V":4},idtype=dtype)
+            npu=cpu.to("npu:0")
+            for g,device in ((cpu,"cpu"),(npu,"npu:0")):
+                r=torch.tensor([0,1],dtype=dtype,device=device)
+                c=torch.tensor([1,0,3],dtype=dtype,device=device)
+                for call in (lambda:g._graph.edge_ids_one(0,r,c),lambda:g.edge_ids(r,c)):
+                    with self.assertRaisesRegex(dgl.DGLError,"Invalid row and col id array"):
+                        call()
+                for row,col in invalid:
+                    r=torch.tensor([row],dtype=dtype,device=device)
+                    c=torch.tensor([col],dtype=dtype,device=device)
+                    expected="Invalid row index" if row<0 or row>=3 else "Invalid col index"
+                    with self.assertRaisesRegex(dgl.DGLError,expected):
+                        g._graph.edge_ids_one(0,r,c)
+
+    def test_error_status_reset_and_query_tiles(self):
+        for dtype in (torch.int32,torch.int64):
+            case=Case("errors",7,17,23,2561,False)
+            values=make_inputs(case,dtype,"random")
+            expected,_=make_runner(case,values,"cpu")
+            run,owners=make_runner(case,values,"npu:0",interface="graph")
+            r,c=owners[-3:-1]
+            for index in (0,63,64,511,512,2560):
+                previous=int(r[index].cpu())
+                r[index]=-1
+                with self.assertRaisesRegex(dgl.DGLError,"Invalid row index: -1"):
+                    run()
+                r[index]=previous
+                exact_check(run(),expected())
+            # Broadcast errors use the original source position when reporting.
+            graph=owners[0]
+            with self.assertRaisesRegex(dgl.DGLError,"Invalid col index: -1"):
+                graph._graph.edge_ids_one(0,r,torch.tensor([-1],dtype=dtype,device="npu:0"))
+            exact_check(run(),expected())
+
     def test_graph_format_fallbacks(self):
         case=Case("formats",7,17,23,37,False)
         for dtype in (torch.int32,torch.int64):

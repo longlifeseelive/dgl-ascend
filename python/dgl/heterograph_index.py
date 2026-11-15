@@ -605,7 +605,10 @@ class HeteroGraphIndex(ObjectBase):
                 except AttributeError:
                     lookup = None
                 if lookup is not None:
-                    eid = lookup(self.handle.value, int(etype), u, v, u, True, 0.)
+                    try:
+                        eid = lookup(self.handle.value, int(etype), u, v, u, True, 0.)
+                    except RuntimeError as exc:
+                        raise DGLError(str(exc)) from exc
                     if eid is not None:
                         return eid
         eid = F.from_dgl_nd(

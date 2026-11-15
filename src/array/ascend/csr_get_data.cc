@@ -24,6 +24,7 @@ extern "C" aclError aclrtGetDeviceInfo(uint32_t, aclrtDevAttr, int64_t*);
 #define DECLARE_GET_DATA(NAME)                                               \
 extern "C" uint32_t aclrtlaunch_##NAME(                                      \
     uint32_t, aclrtStream, void*, void*, void*, void*, void*, void*, void*,    \
+    void*,                                                                  \
     uint32_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,      \
     uint64_t)
 DECLARE_GET_DATA(csr_get_data_int32);
@@ -70,6 +71,15 @@ NDArray NewLookupArray(int64_t n, DGLDataType dtype, DGLContext ctx) {
 #endif
 }
 #ifdef DGL_USE_ASCEND
+constexpr uint32_t kLookupMaxCores = 64;
+struct LookupHostStatus {
+  uint64_t* data = nullptr;
+  LookupHostStatus() {
+    GET_DATA_ACL(aclrtMallocHost(reinterpret_cast<void**>(&data), 512));
+  }
+  ~LookupHostStatus() { if (data) aclrtFreeHost(data); }
+};
+
 uint32_t LookupCores(DGLContext ctx, uint64_t n) {
   static thread_local int device = -1;
   static thread_local uint32_t cores = 40;
@@ -78,7 +88,8 @@ uint32_t LookupCores(DGLContext ctx, uint64_t n) {
     cores = 40;
     if (aclrtGetDeviceInfo(ctx.device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM,
                            &available) == ACL_SUCCESS && available > 0 &&
-        available <= 4096) cores = static_cast<uint32_t>(available);
+        available <= 4096)
+      cores = static_cast<uint32_t>(std::min<int64_t>(available, kLookupMaxCores));
     device = ctx.device_id;
   }
   return static_cast<uint32_t>(std::min<uint64_t>(cores, (n + 63) / 64));
@@ -127,12 +138,17 @@ NDArray Lookup(CSRMatrix csr, NDArray rows, NDArray cols, bool return_eids,
     std::memcpy(&filler_bits, &filler, sizeof(DType));
   }
   const uint32_t cores = LookupCores(ctx, n);
+  // Both allocation paths reserve the preceding 512 bytes. Each core writes
+  // one exact-length uint64 status there, avoiding an extra device allocation.
+  void* status = static_cast<char*>(out->data) - 512;
+  static thread_local LookupHostStatus host_status;
   void* data = CSRHasData(csr) ? csr.data->data : csr.indices->data;
   void* weight_data = return_eids ? csr.indices->data : weights->data;
 #define LAUNCH_LOOKUP(NAME)                                                  \
   GET_DATA_ACL(aclrtlaunch_##NAME(                                           \
       cores, stream, csr.indptr->data, csr.indices->data, data, rows->data,    \
-      cols->data, weight_data, out->data, static_cast<uint32_t>(csr.num_rows),\
+      cols->data, weight_data, out->data, status,                             \
+      static_cast<uint32_t>(csr.num_rows),                                   \
       static_cast<uint64_t>(csr.num_cols), static_cast<uint64_t>(n),          \
       rowlen == 1 ? 0 : 1, collen == 1 ? 0 : 1, CSRHasData(csr) ? 1 : 0,      \
       csr.sorted ? 1 : 0, filler_bits))
@@ -146,7 +162,25 @@ NDArray Lookup(CSRMatrix csr, NDArray rows, NDArray cols, bool return_eids,
     else { LAUNCH_LOOKUP(csr_get_data_weighted_int64); }
   }
 #undef LAUNCH_LOOKUP
+  GET_DATA_ACL(aclrtMemcpyAsync(host_status.data, 512, status,
+      cores * sizeof(uint64_t), ACL_MEMCPY_DEVICE_TO_HOST, stream));
   GET_DATA_ACL(aclrtSynchronizeStream(stream));
+  uint64_t error = 0;
+  for (uint32_t i = 0; i < cores; ++i) {
+    const uint64_t code = host_status.data[i];
+    if (code && (!error || code < error)) error = code;
+  }
+  if (error) {
+    const bool bad_row = error & 1;
+    const uint64_t query = (error - 1) / 2;
+    const NDArray& ids = bad_row ? rows : cols;
+    const uint64_t pos = ids->shape[0] == 1 ? 0 : query;
+    IdType value = 0;
+    GET_DATA_ACL(aclrtMemcpy(&value, sizeof(value),
+        static_cast<const IdType*>(ids->data) + pos, sizeof(value),
+        ACL_MEMCPY_DEVICE_TO_HOST));
+    LOG(FATAL) << (bad_row ? "Invalid row index: " : "Invalid col index: ") << value;
+  }
   return out;
 #else
   LOG(FATAL) << "Ascend support is not compiled.";
@@ -200,7 +234,7 @@ at::Tensor LookupTensorResult(const CSRMatrix& csr, NDArray r, NDArray c,
                   c->dtype.bits == csr.indptr->dtype.bits,
               "CSR and queries require identical ID types");
   const int64_t nr = r->shape[0], nc = c->shape[0];
-  TORCH_CHECK(nr == nc || nr == 1 || nc == 1, "Invalid query broadcasting");
+  TORCH_CHECK(nr == nc || nr == 1 || nc == 1, "Invalid row and col id array.");
   const int64_t n = std::max(nr, nc);
   TORCH_CHECK(n == 0 || (nr > 0 && nc > 0), "Invalid empty query broadcasting");
   const auto device = c10::Device(c10::DeviceType::PrivateUse1,

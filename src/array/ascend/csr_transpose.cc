@@ -18,17 +18,18 @@ extern "C" aclError aclrtGetDeviceInfo(uint32_t, aclrtDevAttr, int64_t*);
 #define TRANSPOSE_ACL(call) CHECK_EQ((call), ACL_SUCCESS)
 #define DECLARE_TRANSPOSE(SUFFIX)                                             \
   extern "C" uint32_t aclrtlaunch_csr_transpose_count_##SUFFIX(               \
-      uint32_t, aclrtStream, void*, void*, uint64_t, uint32_t, uint32_t);       \
+      uint32_t, aclrtStream, void*, void*, uint64_t, uint64_t, uint32_t);       \
   extern "C" uint32_t aclrtlaunch_csr_transpose_prefix_##SUFFIX(              \
-      uint32_t, aclrtStream, void*, void*, void*, void*, uint32_t, uint32_t,    \
+      uint32_t, aclrtStream, void*, void*, void*, void*, uint32_t, uint64_t,    \
       uint32_t);                                                             \
   extern "C" uint32_t aclrtlaunch_csr_transpose_scatter_##SUFFIX(             \
       uint32_t, aclrtStream, void*, void*, void*, void*, void*, void*,         \
-      uint32_t, uint64_t, uint32_t, uint32_t, uint32_t);                        \
+      uint64_t, uint64_t, uint64_t, uint32_t, uint32_t);                        \
   extern "C" uint32_t aclrtlaunch_csr_transpose_zero_##SUFFIX(                \
       uint32_t, aclrtStream, void*, uint64_t)
 DECLARE_TRANSPOSE(int32);
 DECLARE_TRANSPOSE(int64);
+DECLARE_TRANSPOSE(int64_wide);
 #undef DECLARE_TRANSPOSE
 namespace dgl {
 namespace runtime {
@@ -44,6 +45,10 @@ namespace {
 // Retain the caching allocator owner across DGL/PyTorch views, following the
 // existing Ascend allocation convention. Converted results are never cached.
 NDArray NewTransposeArray(int64_t size, DGLDataType dtype, DGLContext ctx) {
+  CHECK_GE(size, 0);
+  CHECK_LE(static_cast<uint64_t>(size),
+           (std::numeric_limits<size_t>::max() - 512) / (dtype.bits / 8))
+      << "CSRTranspose allocation size overflow";
 #ifdef DGL_USE_PYTORCH_NPU_STREAM
   const c10::Device device(c10::DeviceType::PrivateUse1, ctx.device_id);
   auto* allocator = c10_npu::NPUCachingAllocator::get();
@@ -97,14 +102,14 @@ CSRMatrix Transpose(CSRMatrix csr) {
   const auto ctx = csr.indptr->ctx;
   CHECK_EQ(ctx.device_type, kDGLAscend);
   const int64_t nnz = csr.indices->shape[0];
-  // A2 counts/absolute offsets use int32; ID and data payloads keep their width.
-  CHECK_LE(nnz, static_cast<int64_t>(INT32_MAX));
+  CHECK_GE(nnz, 0);
+  CHECK_LE(nnz, std::numeric_limits<IdType>::max());
   CHECK_GE(csr.num_rows, 0);
   CHECK_GE(csr.num_cols, 0);
-  CHECK_LE(csr.num_rows, static_cast<int64_t>(UINT32_MAX));
-  CHECK_LE(csr.num_cols, static_cast<int64_t>(UINT32_MAX));
   CHECK_LE(csr.num_rows, std::numeric_limits<IdType>::max());
   CHECK_LE(csr.num_cols, std::numeric_limits<IdType>::max());
+  CHECK_LT(csr.num_cols, std::numeric_limits<int64_t>::max())
+      << "CSRTranspose indptr length overflow";
   auto ptr = NewTransposeArray(csr.num_cols + 1, csr.indptr->dtype, ctx);
   auto idx = NewTransposeArray(nnz, csr.indices->dtype, ctx);
   auto data = NewTransposeArray(nnz, csr.indices->dtype, ctx);
@@ -129,16 +134,19 @@ CSRMatrix Transpose(CSRMatrix csr) {
   const uint32_t cores = TransposeCores(ctx, nnz);
   // Bands bound UB usage for wide matrices. All inter-band prefix state is
   // device-resident; only shape metadata controls the host launch loop.
-  constexpr uint32_t kBand = 16384;
-  const uint32_t max_cols = std::min<int64_t>(csr.num_cols, kBand);
+  // Counts and absolute offsets must represent E, independently of the ID
+  // payload width. Keep the faster 32-bit stages when their range suffices.
+  const bool wide = nnz > INT32_MAX;
+  const uint32_t band = wide ? 8192 : 16384;
+  const uint32_t max_cols = std::min<int64_t>(csr.num_cols, band);
   const uint32_t max_stride = (max_cols + 7) / 8 * 8;
-  DGLDataType count_type{kDGLInt, 32, 1};
+  DGLDataType count_type{kDGLInt, static_cast<uint8_t>(wide ? 64 : 32), 1};
   auto counts = NewTransposeArray(cores * max_stride, count_type, ctx);
   auto offsets = NewTransposeArray(cores * max_stride, count_type, ctx);
   auto carry = NewTransposeArray(8, count_type, ctx);
   for (uint64_t first = 0; first < static_cast<uint64_t>(csr.num_cols);
-       first += kBand) {
-    const uint32_t cols = std::min<uint64_t>(kBand, csr.num_cols - first);
+       first += band) {
+    const uint32_t cols = std::min<uint64_t>(band, csr.num_cols - first);
     void* input_data = CSRHasData(csr) ? csr.data->data : csr.indices->data;
 #define LAUNCH_TRANSPOSE(SUFFIX)                                              \
     TRANSPOSE_ACL(aclrtlaunch_csr_transpose_count_##SUFFIX(                   \
@@ -153,7 +161,11 @@ CSRMatrix Transpose(CSRMatrix csr) {
     if constexpr (sizeof(IdType) == 4) {
       LAUNCH_TRANSPOSE(int32);
     } else {
-      LAUNCH_TRANSPOSE(int64);
+      if (wide) {
+        LAUNCH_TRANSPOSE(int64_wide);
+      } else {
+        LAUNCH_TRANSPOSE(int64);
+      }
     }
 #undef LAUNCH_TRANSPOSE
   }
