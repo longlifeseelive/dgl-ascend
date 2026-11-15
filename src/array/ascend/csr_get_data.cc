@@ -1,174 +1,181 @@
+#ifdef DGL_USE_PYTORCH_NPU_STREAM
+#include <ATen/ATen.h>
+#include <ATen/record_function.h>
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUGuard.h>
+#endif
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <dgl/array.h>
+#include <dgl/runtime/registry.h>
+#include "../array_op.h"
+
 #ifdef DGL_USE_ASCEND
 #include <acl/acl.h>
-#include <acl/acl_rt.h>
-#define ASCEND_CALL(func)                                                \
-  {                                                                      \
-    aclError e = (func);                                                 \
-    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;              \
-  }
-
-#ifndef ACLRT_LAUNCH_KERNEL
-#define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
-#endif
-
-extern "C" uint32_t aclrtlaunch_csr_get_data_int32(
-    uint32_t blockDim, aclrtStream stream,
-    void* indptr, void* indices, void* data,
-    void* rows, void* cols, void* out, void* tiling);
-
-extern "C" uint32_t aclrtlaunch_csr_get_data_int64(
-    uint32_t blockDim, aclrtStream stream,
-    void* indptr, void* indices, void* data,
-    void* rows, void* cols, void* out, void* tiling);
-
-extern "C" uint32_t aclrtlaunch_csr_get_data_weighted_int32(
-    uint32_t blockDim, aclrtStream stream,
-    void* indptr, void* indices, void* data,
-    void* rows, void* cols, void* weights,
-    void* out, void* tiling);
-
-extern "C" uint32_t aclrtlaunch_csr_get_data_weighted_int64(
-    uint32_t blockDim, aclrtStream stream,
-    void* indptr, void* indices, void* data,
-    void* rows, void* cols, void* weights,
-    void* out, void* tiling);
-
+extern "C" aclError aclrtGetDeviceInfo(uint32_t, aclrtDevAttr, int64_t*);
+#define GET_DATA_ACL(call) CHECK_EQ((call), ACL_SUCCESS)
+#define DECLARE_GET_DATA(NAME)                                               \
+extern "C" uint32_t aclrtlaunch_##NAME(                                      \
+    uint32_t, aclrtStream, void*, void*, void*, void*, void*, void*, void*,    \
+    uint32_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,      \
+    uint64_t)
+DECLARE_GET_DATA(csr_get_data_int32);
+DECLARE_GET_DATA(csr_get_data_int64);
+DECLARE_GET_DATA(csr_get_data_weighted_int32);
+DECLARE_GET_DATA(csr_get_data_weighted_int64);
+DECLARE_GET_DATA(csr_get_data_weighted_f64_int32);
+DECLARE_GET_DATA(csr_get_data_weighted_f64_int64);
+#undef DECLARE_GET_DATA
 namespace dgl {
-namespace runtime {
-aclrtStream getCurrentAscendStream();
-}
+namespace runtime { aclrtStream getCurrentAscendStream(); }
 }
 #endif
-
-#include <dgl/array.h>
-#include "../array_op.h"
 
 namespace dgl {
 namespace aten {
 namespace impl {
+namespace {
+NDArray NewLookupArray(int64_t n, DGLDataType dtype, DGLContext ctx) {
+#ifdef DGL_USE_PYTORCH_NPU_STREAM
+  const c10::Device device(c10::DeviceType::PrivateUse1, ctx.device_id);
+  auto* allocator = c10_npu::NPUCachingAllocator::get();
+  if (!allocator->initialized()) {
+    at::empty({0}, at::TensorOptions().device(device).dtype(at::kByte));
+  }
+  const c10_npu::NPUGuard guard(device);
+  auto owner = std::make_unique<c10::DataPtr>(
+      allocator->allocate(static_cast<size_t>(n) * (dtype.bits / 8) + 512));
+  auto container = std::make_unique<NDArray::Container>();
+  container->dl_tensor.data = static_cast<char*>(owner->get()) + 512;
+  container->dl_tensor.ctx = ctx;
+  container->dl_tensor.dtype = dtype;
+  container->dl_tensor.ndim = 1;
+  container->dl_tensor.shape = new int64_t[1]{n};
+  container->manager_ctx = owner.release();
+  container->deleter = [](NDArray::Container* self) {
+    delete static_cast<c10::DataPtr*>(self->manager_ctx);
+    delete[] self->dl_tensor.shape;
+    delete self;
+  };
+  return NDArray(container.release());
+#else
+  return NDArray::Empty({n}, dtype, ctx);
+#endif
+}
+#ifdef DGL_USE_ASCEND
+uint32_t LookupCores(DGLContext ctx, uint64_t n) {
+  static thread_local int device = -1;
+  static thread_local uint32_t cores = 40;
+  if (device != ctx.device_id) {
+    int64_t available = 0;
+    cores = 40;
+    if (aclrtGetDeviceInfo(ctx.device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM,
+                           &available) == ACL_SUCCESS && available > 0 &&
+        available <= 4096) cores = static_cast<uint32_t>(available);
+    device = ctx.device_id;
+  }
+  return static_cast<uint32_t>(std::min<uint64_t>(cores, (n + 63) / 64));
+}
+#endif
+}  // namespace
 
 template <DGLDeviceType XPU, typename IdType, typename DType>
-NDArray CSRGetData(
-    CSRMatrix csr, NDArray rows, NDArray cols, bool return_eids,
-    NDArray weights, DType filler) {
+NDArray CSRGetData(CSRMatrix csr, NDArray rows, NDArray cols, bool return_eids,
+                  NDArray weights, DType filler) {
 #ifdef DGL_USE_ASCEND
-  auto ctx = rows->ctx;
-  CHECK(ctx.device_type == kDGLAscend)
-      << "Expected Ascend device context for CSRGetData";
-
-  const int64_t rowlen = rows->shape[0];
-  const int64_t collen = cols->shape[0];
-  CHECK((rowlen == collen) || (rowlen == 1) || (collen == 1))
+#ifdef DGL_USE_PYTORCH_NPU_STREAM
+  RECORD_FUNCTION("dgl::CSRGetData[Ascend]", std::vector<c10::IValue>());
+#endif
+  const auto ctx = rows->ctx;
+  CHECK_EQ(ctx.device_type, kDGLAscend);
+  CHECK_EQ(csr.indptr->ctx, ctx);
+  CHECK_EQ(csr.indices->ctx, ctx);
+  CHECK_EQ(cols->ctx, ctx);
+  CHECK_EQ(rows->ndim, 1); CHECK_EQ(cols->ndim, 1);
+  CHECK_GE(csr.num_rows, 0);
+  CHECK_LE(csr.num_rows, static_cast<int64_t>(UINT32_MAX) - 1);
+  const int64_t rowlen = rows->shape[0], collen = cols->shape[0];
+  CHECK(rowlen == collen || rowlen == 1 || collen == 1)
       << "Invalid row and col id array.";
-
-  const int64_t rstlen = std::max(rowlen, collen);
-  NDArray rst = NDArray::Empty({rstlen},
-      return_eids ? csr.indices->dtype : weights->dtype, ctx);
-  if (rstlen == 0) return rst;
-
-  ASCEND_CALL(aclrtSetDevice(ctx.device_id));
-
-  auto stream = dgl::runtime::getCurrentAscendStream();
-
-  uint32_t numRows = static_cast<uint32_t>(csr.num_rows);
-  uint32_t numCols = static_cast<uint32_t>(csr.num_cols);
-  uint32_t nnz = static_cast<uint32_t>(csr.indices->shape[0]);
-  uint32_t n = static_cast<uint32_t>(rstlen);
-  uint32_t block_dim = 1;
-
-  uint32_t tiling_bytes = 24;  // 5 u32 + 8 bytes (int64 or float)
-  void* tiling_dev = nullptr;
-  ASCEND_CALL(aclrtMalloc(&tiling_dev, tiling_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-
-  // Pack tiling: [numRows, numCols, nnz, n, filler_bytes]
-  // filler uses 8 bytes: int64 for return_eids, float for weighted
-  struct {
-    uint32_t numRows;
-    uint32_t numCols;
-    uint32_t nnz;
-    uint32_t n;
-    union {
-      int64_t i64;
-      float f32;
-    } filler;
-  } tiling_host;
-  tiling_host.numRows = numRows;
-  tiling_host.numCols = numCols;
-  tiling_host.nnz = nnz;
-  tiling_host.n = n;
-  if (return_eids) {
-    tiling_host.filler.i64 = static_cast<int64_t>(filler);
-  } else {
-    tiling_host.filler.f32 = static_cast<float>(filler);
+  const int64_t n = std::max(rowlen, collen);
+  CHECK(n == 0 || (rowlen > 0 && collen > 0));
+  if (!return_eids) {
+    CHECK_EQ(weights->ctx, ctx);
+    CHECK_EQ(weights->ndim, 1);
+    // CSR data may reference a larger feature vector (e.g. a CSR slice).
+    // As on CPU, callers must provide weights covering the referenced EIDs.
   }
-
-  ASCEND_CALL(aclrtMemcpy(tiling_dev, tiling_bytes,
-                           &tiling_host, tiling_bytes,
-                           ACL_MEMCPY_HOST_TO_DEVICE));
-
+  auto out = NewLookupArray(n, return_eids ? csr.indices->dtype : weights->dtype, ctx);
+  if (!n) return out;
+  int32_t current = -1;
+  GET_DATA_ACL(aclrtGetDevice(&current));
+  if (current != ctx.device_id) GET_DATA_ACL(aclrtSetDevice(ctx.device_id));
+  const auto stream = runtime::getCurrentAscendStream();
+  uint64_t filler_bits = 0;
   if (return_eids) {
-    // return_eids=true: returning edge IDs (IdType == DType)
-    if (std::is_same<IdType, int32_t>::value) {
-      aclError err = aclrtlaunch_csr_get_data_int32(
-          block_dim, stream,
-          csr.indptr->data, csr.indices->data,
-          CSRHasData(csr) ? csr.data->data : csr.indices->data,
-          rows->data, cols->data, rst->data, tiling_dev);
-      CHECK(err == ACL_SUCCESS) << "csr_get_data_int32 launch failed: " << err;
-    } else {
-      aclError err = aclrtlaunch_csr_get_data_int64(
-          block_dim, stream,
-          csr.indptr->data, csr.indices->data,
-          CSRHasData(csr) ? csr.data->data : csr.indices->data,
-          rows->data, cols->data, rst->data, tiling_dev);
-      CHECK(err == ACL_SUCCESS) << "csr_get_data_int64 launch failed: " << err;
-    }
+    // The public EID contract is -1 for misses. The existing Ascend array
+    // dispatcher supplies zero here; normalize locally without changing it.
+    filler_bits = ~uint64_t(0);
   } else {
-    // Weighted path: return weight values (DType = float)
-    if (std::is_same<IdType, int32_t>::value) {
-      aclError err = aclrtlaunch_csr_get_data_weighted_int32(
-          block_dim, stream,
-          csr.indptr->data, csr.indices->data,
-          CSRHasData(csr) ? csr.data->data : csr.indices->data,
-          rows->data, cols->data, weights->data, rst->data, tiling_dev);
-      CHECK(err == ACL_SUCCESS) << "csr_get_data_weighted_int32 launch failed: " << err;
-    } else {
-      aclError err = aclrtlaunch_csr_get_data_weighted_int64(
-          block_dim, stream,
-          csr.indptr->data, csr.indices->data,
-          CSRHasData(csr) ? csr.data->data : csr.indices->data,
-          rows->data, cols->data, weights->data, rst->data, tiling_dev);
-      CHECK(err == ACL_SUCCESS) << "csr_get_data_weighted_int64 launch failed: " << err;
-    }
+    std::memcpy(&filler_bits, &filler, sizeof(DType));
   }
-
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
-  if (tiling_dev) ASCEND_CALL(aclrtFree(tiling_dev));
-
-  return rst;
+  const uint32_t cores = LookupCores(ctx, n);
+  void* data = CSRHasData(csr) ? csr.data->data : csr.indices->data;
+  void* weight_data = return_eids ? csr.indices->data : weights->data;
+#define LAUNCH_LOOKUP(NAME)                                                  \
+  GET_DATA_ACL(aclrtlaunch_##NAME(                                           \
+      cores, stream, csr.indptr->data, csr.indices->data, data, rows->data,    \
+      cols->data, weight_data, out->data, static_cast<uint32_t>(csr.num_rows),\
+      static_cast<uint64_t>(csr.num_cols), static_cast<uint64_t>(n),          \
+      rowlen == 1 ? 0 : 1, collen == 1 ? 0 : 1, CSRHasData(csr) ? 1 : 0,      \
+      csr.sorted ? 1 : 0, filler_bits))
+  if constexpr (sizeof(IdType) == 4) {
+    if (return_eids) { LAUNCH_LOOKUP(csr_get_data_int32); }
+    else if constexpr (sizeof(DType) == 8) { LAUNCH_LOOKUP(csr_get_data_weighted_f64_int32); }
+    else { LAUNCH_LOOKUP(csr_get_data_weighted_int32); }
+  } else {
+    if (return_eids) { LAUNCH_LOOKUP(csr_get_data_int64); }
+    else if constexpr (sizeof(DType) == 8) { LAUNCH_LOOKUP(csr_get_data_weighted_f64_int64); }
+    else { LAUNCH_LOOKUP(csr_get_data_weighted_int64); }
+  }
+#undef LAUNCH_LOOKUP
+  GET_DATA_ACL(aclrtSynchronizeStream(stream));
+  return out;
 #else
   LOG(FATAL) << "Ascend support is not compiled.";
   return {};
 #endif
 }
 
-// Explicit instantiations for the 6-arg version (return_eids=true, IdType=DType)
-template NDArray CSRGetData<kDGLAscend, int32_t, int32_t>(
-    CSRMatrix, NDArray, NDArray, bool, NDArray, int32_t);
-template NDArray CSRGetData<kDGLAscend, int64_t, int64_t>(
-    CSRMatrix, NDArray, NDArray, bool, NDArray, int64_t);
-
-// Explicit instantiations for weighted version (return_eids=false, DType=float/double)
-template NDArray CSRGetData<kDGLAscend, int32_t, float>(
-    CSRMatrix, NDArray, NDArray, bool, NDArray, float);
-template NDArray CSRGetData<kDGLAscend, int64_t, float>(
-    CSRMatrix, NDArray, NDArray, bool, NDArray, float);
-template NDArray CSRGetData<kDGLAscend, int32_t, double>(
-    CSRMatrix, NDArray, NDArray, bool, NDArray, double);
-template NDArray CSRGetData<kDGLAscend, int64_t, double>(
-    CSRMatrix, NDArray, NDArray, bool, NDArray, double);
-
+#define INSTANTIATE_GET_DATA(ID, DTYPE)                                      \
+template NDArray CSRGetData<kDGLAscend, ID, DTYPE>(                           \
+    CSRMatrix, NDArray, NDArray, bool, NDArray, DTYPE)
+INSTANTIATE_GET_DATA(int32_t, int32_t);
+INSTANTIATE_GET_DATA(int64_t, int64_t);
+INSTANTIATE_GET_DATA(int32_t, float);
+INSTANTIATE_GET_DATA(int64_t, float);
+INSTANTIATE_GET_DATA(int32_t, double);
+INSTANTIATE_GET_DATA(int64_t, double);
+#undef INSTANTIATE_GET_DATA
 }  // namespace impl
+
+// A scoped packed entry for directly using CSRGetData with a SparseMatrix,
+// including sorted metadata, broadcasting and a custom weighted filler.
+// Graph EID/CSRMask paths above use the same implementation unchanged.
+DGL_REGISTER_GLOBAL("ascend._CAPI_DGLCSRGetData")
+    .set_body([](runtime::DGLArgs args, runtime::DGLRetValue* rv) {
+      SparseMatrixRef matrix = args[0];
+      CHECK_EQ(matrix->format, static_cast<int32_t>(SparseFormat::kCSR));
+      const CSRMatrix csr(matrix->num_rows, matrix->num_cols,
+                          matrix->indices[0], matrix->indices[1],
+                          matrix->indices[2], matrix->flags[0]);
+      NDArray rows = args[1], cols = args[2], weights = args[4];
+      const bool eids = args[3];
+      const double filler = args[5];
+      if (eids) *rv = aten::CSRGetData(csr, rows, cols);
+      else *rv = aten::CSRGetFloatingData(csr, rows, cols, weights, filler);
+    });
 }  // namespace aten
 }  // namespace dgl
-

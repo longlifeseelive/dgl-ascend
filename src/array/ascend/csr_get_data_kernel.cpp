@@ -1,228 +1,215 @@
 #include "kernel_operator.h"
-
 using namespace AscendC;
 
-template <typename IdxT>
-class KernelCsrGetData {
- public:
-  __aicore__ inline KernelCsrGetData() {}
+namespace {
+// Prefetch a group of independent rows before waiting for MTE2. All query and
+// result transfers are contiguous DMAs; no scalar GM output stores are used.
+constexpr uint32_t kQueries = 512;
+constexpr uint32_t kBatch = 64;
+constexpr uint32_t kRow = 128;
+constexpr uint32_t kPtrLimit = 12288;
 
+template <typename T>
+__aicore__ inline void Load(LocalTensor<T> dst, GlobalTensor<T> src,
+                            uint64_t pos, uint32_t size) {
+  DataCopyExtParams cp{1, static_cast<uint32_t>(size * sizeof(T)), 0, 0, 0};
+  DataCopyPadExtParams<T> pad{false, 0, 0, 0};
+  DataCopyPad(dst, src[pos], cp, pad);
+}
+
+template <typename IdT, typename OutT, bool Weighted>
+class KernelLookup {
+ public:
   __aicore__ inline void Init(
-      GM_ADDR indptr, GM_ADDR indices, GM_ADDR data,
-      GM_ADDR rows, GM_ADDR cols, GM_ADDR out,
-      uint32_t numRows, uint32_t numCols, uint32_t nnz,
-      uint32_t n, int64_t filler) {
-    indptr_gm.SetGlobalBuffer((__gm__ IdxT *)indptr, numRows + 1);
-    indices_gm.SetGlobalBuffer((__gm__ IdxT *)indices, nnz);
-    data_gm.SetGlobalBuffer((__gm__ IdxT *)data, nnz);
-    rows_gm.SetGlobalBuffer((__gm__ IdxT *)rows, n);
-    cols_gm.SetGlobalBuffer((__gm__ IdxT *)cols, n);
-    out_gm.SetGlobalBuffer((__gm__ IdxT *)out, n);
-    numRows_ = numRows;
-    numCols_ = numCols;
-    nnz_ = nnz;
-    n_ = n;
-    filler_ = filler;
+      GM_ADDR ptr, GM_ADDR idx, GM_ADDR data, GM_ADDR rows, GM_ADDR cols,
+      GM_ADDR weights, GM_ADDR out, uint32_t num_rows, uint64_t num_cols,
+      uint64_t count, uint32_t row_stride, uint32_t col_stride,
+      uint32_t has_data, uint32_t sorted, uint64_t filler, TPipe* pipe) {
+    ptr_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(ptr));
+    idx_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(idx));
+    data_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(data));
+    rows_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(rows));
+    cols_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdT*>(cols));
+    weights_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ OutT*>(weights));
+    out_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ OutT*>(out));
+    num_rows_ = num_rows; num_cols_ = num_cols; count_ = count;
+    row_stride_ = row_stride; col_stride_ = col_stride;
+    has_data_ = has_data; sorted_ = sorted; filler_ = static_cast<OutT>(filler);
+    const uint64_t chunk = ((count + GetBlockNum() - 1) / GetBlockNum() + 7) / 8 * 8;
+    begin_ = GetBlockIdx() * chunk;
+    end_ = begin_ + chunk < count ? begin_ + chunk : count;
+    cache_ptr_ = num_rows < kPtrLimit && chunk >= kBatch;
+    pipe->InitBuffer(ptr_buf_, cache_ptr_ ? ((num_rows + 8) / 8 * 8) * sizeof(IdT) : 32);
+    pipe->InitBuffer(rows_buf_, kQueries * sizeof(IdT));
+    pipe->InitBuffer(cols_buf_, kQueries * sizeof(IdT));
+    pipe->InitBuffer(out_buf_, kQueries * sizeof(OutT));
+    pipe->InitBuffer(row_buf_, kBatch * kRow * sizeof(IdT));
+    pipe->InitBuffer(start_buf_, kBatch * sizeof(IdT));
+    pipe->InitBuffer(end_buf_, kBatch * sizeof(IdT));
+    pipe->InitBuffer(mask_lo_buf_, kBatch * 32);
+    pipe->InitBuffer(mask_hi_buf_, sizeof(IdT) == 8 ? kBatch * 32 : 32);
   }
 
   __aicore__ inline void Process() {
-    uint32_t block_id = GetBlockIdx();
-    uint32_t block_num = GetBlockNum();
-    uint32_t chunk = (n_ + block_num - 1) / block_num;
-    uint32_t start = block_id * chunk;
-    uint32_t end = (start + chunk > n_) ? n_ : start + chunk;
-    for (uint32_t i = start; i < end; i++) {
-      IdxT row_id = rows_gm.GetValue(i);
-      IdxT col_id = cols_gm.GetValue(i);
-
-      IdxT start_pos = indptr_gm.GetValue(static_cast<uint32_t>(row_id));
-      IdxT end_pos = indptr_gm.GetValue(static_cast<uint32_t>(row_id) + 1);
-
-      IdxT result = filler_;
-      for (IdxT j = start_pos; j < end_pos; j++) {
-        if (indices_gm.GetValue(static_cast<uint32_t>(j)) == col_id) {
-          result = data_gm.GetValue(static_cast<uint32_t>(j));
-          break;
+    if (begin_ >= end_) return;
+    auto pointers = ptr_buf_.Get<IdT>();
+    auto rows = rows_buf_.Get<IdT>();
+    auto cols = cols_buf_.Get<IdT>();
+    auto result = out_buf_.Get<OutT>();
+    auto row_data = row_buf_.Get<IdT>();
+    auto starts = start_buf_.Get<IdT>();
+    auto ends = end_buf_.Get<IdT>();
+    if (cache_ptr_) {
+      Load(pointers, ptr_gm_, 0, num_rows_ + 1);
+      SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
+    }
+    for (uint64_t base = begin_; base < end_; base += kQueries) {
+      const uint32_t n = end_ - base < kQueries ? end_ - base : kQueries;
+      SetFlag<HardEvent::S_MTE2>(0); WaitFlag<HardEvent::S_MTE2>(0);
+      Load(rows, rows_gm_, row_stride_ ? base : 0, row_stride_ ? n : 1);
+      Load(cols, cols_gm_, col_stride_ ? base : 0, col_stride_ ? n : 1);
+      SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
+      for (uint32_t batch = 0; batch < n; batch += kBatch) {
+        const uint32_t qn = n - batch < kBatch ? n - batch : kBatch;
+        SetFlag<HardEvent::S_MTE2>(0); WaitFlag<HardEvent::S_MTE2>(0);
+        for (uint32_t i = 0; i < qn; ++i) {
+          const IdT r = rows.GetValue(row_stride_ ? batch + i : 0);
+          const IdT c = cols.GetValue(col_stride_ ? batch + i : 0);
+          IdT start = 0, stop = 0;
+          // Valid IDs are the public contract. Guard malformed device input
+          // here to prevent an out-of-range device memory access.
+          if (r >= 0 && static_cast<uint64_t>(r) < num_rows_ &&
+              c >= 0 && static_cast<uint64_t>(c) < num_cols_) {
+            start = cache_ptr_ ? pointers.GetValue(r) : ptr_gm_.GetValue(r);
+            stop = cache_ptr_ ? pointers.GetValue(r + 1) : ptr_gm_.GetValue(r + 1);
+          }
+          starts.SetValue(i, start); ends.SetValue(i, stop);
+          const uint64_t degree = static_cast<uint64_t>(stop - start);
+          if (degree && !(sorted_ && degree > kRow)) {
+            Load(row_data[i * kRow], idx_gm_, start,
+                 degree < kRow ? static_cast<uint32_t>(degree) : kRow);
+          }
+        }
+        SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
+        SetFlag<HardEvent::MTE2_V>(0); WaitFlag<HardEvent::MTE2_V>(0);
+        SetFlag<HardEvent::S_V>(0); WaitFlag<HardEvent::S_V>(0);
+        for (uint32_t i = 0; i < qn; ++i) {
+          const IdT degree = ends.GetValue(i) - starts.GetValue(i);
+          if (degree > 0 && !(sorted_ && degree > kRow)) {
+            MakeMask(i, cols.GetValue(col_stride_ ? batch + i : 0),
+                     degree < kRow ? degree : kRow);
+          }
+        }
+        SetFlag<HardEvent::V_S>(0); WaitFlag<HardEvent::V_S>(0);
+        for (uint32_t i = 0; i < qn; ++i) {
+          const IdT c = cols.GetValue(col_stride_ ? batch + i : 0);
+          const IdT start = starts.GetValue(i), stop = ends.GetValue(i);
+          IdT found = -1;
+          if (sorted_ && static_cast<uint64_t>(stop - start) > kRow) {
+            // lower_bound preserves the first occurrence in a multigraph.
+            IdT lo = start, hi = stop;
+            while (lo < hi) {
+              const IdT mid = lo + (hi - lo) / 2;
+              if (idx_gm_.GetValue(mid) < c) lo = mid + 1;
+              else hi = mid;
+            }
+            if (lo < stop && idx_gm_.GetValue(lo) == c) found = lo;
+          } else {
+            for (IdT tile = start; tile < stop; tile += kRow) {
+              const uint32_t take = stop - tile < kRow ? stop - tile : kRow;
+              if (tile != start) {
+                SetFlag<HardEvent::S_MTE2>(0); WaitFlag<HardEvent::S_MTE2>(0);
+                Load(row_data[i * kRow], idx_gm_, tile, take);
+                SetFlag<HardEvent::MTE2_V>(0); WaitFlag<HardEvent::MTE2_V>(0);
+                SetFlag<HardEvent::S_V>(0); WaitFlag<HardEvent::S_V>(0);
+                MakeMask(i, c, take);
+                SetFlag<HardEvent::V_S>(0); WaitFlag<HardEvent::V_S>(0);
+              }
+              const int32_t match = FirstMatch(i, take);
+              if (match >= 0) found = tile + match;
+              if (found >= 0) break;
+            }
+          }
+          OutT value = filler_;
+          if (found >= 0) {
+            const IdT eid = has_data_ ? data_gm_.GetValue(found) : found;
+            if constexpr (Weighted) value = weights_gm_.GetValue(eid);
+            else value = static_cast<OutT>(eid);
+          }
+          result.SetValue(batch + i, value);
         }
       }
-      out_gm.SetValue(i, result);
+      SetFlag<HardEvent::S_MTE3>(0); WaitFlag<HardEvent::S_MTE3>(0);
+      DataCopyExtParams cp{1, static_cast<uint32_t>(n * sizeof(OutT)), 0, 0, 0};
+      DataCopyPad(out_gm_[base], result, cp);
+      SetFlag<HardEvent::MTE3_S>(0); WaitFlag<HardEvent::MTE3_S>(0);
     }
   }
-
  private:
-  GlobalTensor<IdxT> indptr_gm;
-  GlobalTensor<IdxT> indices_gm;
-  GlobalTensor<IdxT> data_gm;
-  GlobalTensor<IdxT> rows_gm;
-  GlobalTensor<IdxT> cols_gm;
-  GlobalTensor<IdxT> out_gm;
-  uint32_t numRows_;
-  uint32_t numCols_;
-  uint32_t nnz_;
-  uint32_t n_;
-  int64_t filler_;
-};
-
-struct CsrGetDataTiling {
-  uint32_t numRows;
-  uint32_t numCols;
-  uint32_t nnz;
-  uint32_t n;
-  int64_t filler;
-};
-
-extern "C" __global__ __aicore__ void csr_get_data_int32(
-    GM_ADDR indptr, GM_ADDR indices, GM_ADDR data,
-    GM_ADDR rows, GM_ADDR cols, GM_ADDR out,
-    GM_ADDR tiling_ptr) {
-  GlobalTensor<uint32_t> tilingGm;
-  tilingGm.SetGlobalBuffer((__gm__ uint32_t *)tiling_ptr, 5);
-  uint32_t numRows = tilingGm.GetValue(0);
-  uint32_t numCols = tilingGm.GetValue(1);
-  uint32_t nnz = tilingGm.GetValue(2);
-  uint32_t n = tilingGm.GetValue(3);
-
-  GlobalTensor<int64_t> tilingI64;
-  tilingI64.SetGlobalBuffer((__gm__ int64_t *)((__gm__ uint8_t *)tiling_ptr + 16), 1);
-  int64_t filler = tilingI64.GetValue(0);
-
-  KernelCsrGetData<int32_t> op;
-  op.Init(indptr, indices, data, rows, cols, out,
-          numRows, numCols, nnz, n, filler);
-  op.Process();
-}
-
-extern "C" __global__ __aicore__ void csr_get_data_int64(
-    GM_ADDR indptr, GM_ADDR indices, GM_ADDR data,
-    GM_ADDR rows, GM_ADDR cols, GM_ADDR out,
-    GM_ADDR tiling_ptr) {
-  GlobalTensor<uint32_t> tilingGm;
-  tilingGm.SetGlobalBuffer((__gm__ uint32_t *)tiling_ptr, 5);
-  uint32_t numRows = tilingGm.GetValue(0);
-  uint32_t numCols = tilingGm.GetValue(1);
-  uint32_t nnz = tilingGm.GetValue(2);
-  uint32_t n = tilingGm.GetValue(3);
-
-  GlobalTensor<int64_t> tilingI64;
-  tilingI64.SetGlobalBuffer((__gm__ int64_t *)((__gm__ uint8_t *)tiling_ptr + 16), 1);
-  int64_t filler = tilingI64.GetValue(0);
-
-  KernelCsrGetData<int64_t> op;
-  op.Init(indptr, indices, data, rows, cols, out,
-          numRows, numCols, nnz, n, filler);
-  op.Process();
-}
-
-template <typename IdxT>
-class KernelCsrGetDataWithWeights {
- public:
-  __aicore__ inline KernelCsrGetDataWithWeights() {}
-
-  __aicore__ inline void Init(
-      GM_ADDR indptr, GM_ADDR indices, GM_ADDR data,
-      GM_ADDR rows, GM_ADDR cols, GM_ADDR weights,
-      GM_ADDR out, uint32_t numRows, uint32_t numCols,
-      uint32_t nnz, uint32_t n, float filler) {
-    indptr_gm.SetGlobalBuffer((__gm__ IdxT *)indptr, numRows + 1);
-    indices_gm.SetGlobalBuffer((__gm__ IdxT *)indices, nnz);
-    data_gm.SetGlobalBuffer((__gm__ IdxT *)data, nnz);
-    rows_gm.SetGlobalBuffer((__gm__ IdxT *)rows, n);
-    cols_gm.SetGlobalBuffer((__gm__ IdxT *)cols, n);
-    weights_gm.SetGlobalBuffer((__gm__ float *)weights, nnz);
-    out_gm.SetGlobalBuffer((__gm__ float *)out, n);
-    numRows_ = numRows;
-    numCols_ = numCols;
-    nnz_ = nnz;
-    n_ = n;
-    filler_ = filler;
+  template <uint32_t Width>
+  __aicore__ inline void CompareRow(uint32_t slot, IdT col) {
+    constexpr uint32_t words = sizeof(IdT) / 4;
+    auto input = row_buf_.Get<int32_t>();
+    CompareScalar(mask_lo_buf_.Get<uint8_t>()[slot * 32],
+                  input[slot * kRow * words], static_cast<int32_t>(col),
+                  CMPMODE::EQ, Width * words);
+    if constexpr (sizeof(IdT) == 8) {
+      CompareScalar(mask_hi_buf_.Get<uint8_t>()[slot * 32],
+                    input[slot * kRow * words],
+                    static_cast<int32_t>(static_cast<uint64_t>(col) >> 32),
+                    CMPMODE::EQ, Width * words);
+    }
   }
-
-  __aicore__ inline void Process() {
-    uint32_t block_id = GetBlockIdx();
-    uint32_t block_num = GetBlockNum();
-    uint32_t chunk = (n_ + block_num - 1) / block_num;
-    uint32_t start = block_id * chunk;
-    uint32_t end = (start + chunk > n_) ? n_ : start + chunk;
-    for (uint32_t i = start; i < end; i++) {
-      IdxT row_id = rows_gm.GetValue(i);
-      IdxT col_id = cols_gm.GetValue(i);
-
-      IdxT start_pos = indptr_gm.GetValue(static_cast<uint32_t>(row_id));
-      IdxT end_pos = indptr_gm.GetValue(static_cast<uint32_t>(row_id) + 1);
-
-      float result = filler_;
-      for (IdxT j = start_pos; j < end_pos; j++) {
-        if (indices_gm.GetValue(static_cast<uint32_t>(j)) == col_id) {
-          result = weights_gm.GetValue(static_cast<uint32_t>(j));
-          break;
-        }
+  __aicore__ inline void MakeMask(uint32_t slot, IdT col, uint32_t take) {
+    if (take <= 64) CompareRow<64>(slot, col);
+    else CompareRow<128>(slot, col);
+  }
+  __aicore__ inline int32_t FirstMatch(uint32_t slot, uint32_t take) {
+    constexpr uint32_t words = sizeof(IdT) / 4;
+    constexpr uint32_t span = 64 / words;
+    auto low = mask_lo_buf_.Get<uint64_t>();
+    auto high = mask_hi_buf_.Get<uint64_t>();
+    for (uint32_t group = 0; group * span < take; ++group) {
+      uint64_t bits = low.GetValue(slot * 4 + group);
+      if constexpr (sizeof(IdT) == 8) {
+        bits &= (high.GetValue(slot * 4 + group) >> 1) & 0x5555555555555555ULL;
       }
-      out_gm.SetValue(i, result);
+      const uint32_t valid = take - group * span < span ? take - group * span : span;
+      if (valid * words < 64) bits &= (uint64_t(1) << (valid * words)) - 1;
+      if (bits) return group * span + static_cast<uint32_t>(GetSFFValue<1>(bits)) / words;
     }
+    return -1;
   }
-
- private:
-  GlobalTensor<IdxT> indptr_gm;
-  GlobalTensor<IdxT> indices_gm;
-  GlobalTensor<IdxT> data_gm;
-  GlobalTensor<IdxT> rows_gm;
-  GlobalTensor<IdxT> cols_gm;
-  GlobalTensor<float> weights_gm;
-  GlobalTensor<float> out_gm;
-  uint32_t numRows_;
-  uint32_t numCols_;
-  uint32_t nnz_;
-  uint32_t n_;
-  float filler_;
+  GlobalTensor<IdT> ptr_gm_, idx_gm_, data_gm_, rows_gm_, cols_gm_;
+  GlobalTensor<OutT> weights_gm_, out_gm_;
+  TBuf<TPosition::VECCALC> ptr_buf_, rows_buf_, cols_buf_, out_buf_, row_buf_;
+  TBuf<TPosition::VECCALC> start_buf_, end_buf_;
+  TBuf<TPosition::VECCALC> mask_lo_buf_, mask_hi_buf_;
+  uint64_t num_cols_, count_, begin_, end_;
+  uint32_t num_rows_, row_stride_, col_stride_, has_data_, sorted_;
+  bool cache_ptr_;
+  OutT filler_;
 };
+}  // namespace
 
-struct CsrGetDataWeightedTiling {
-  uint32_t numRows;
-  uint32_t numCols;
-  uint32_t nnz;
-  uint32_t n;
-  float filler;
-};
-
-extern "C" __global__ __aicore__ void csr_get_data_weighted_int32(
-    GM_ADDR indptr, GM_ADDR indices, GM_ADDR data,
-    GM_ADDR rows, GM_ADDR cols, GM_ADDR weights,
-    GM_ADDR out, GM_ADDR tiling_ptr) {
-  GlobalTensor<uint32_t> tilingGm;
-  tilingGm.SetGlobalBuffer((__gm__ uint32_t *)tiling_ptr, 5);
-  uint32_t numRows = tilingGm.GetValue(0);
-  uint32_t numCols = tilingGm.GetValue(1);
-  uint32_t nnz = tilingGm.GetValue(2);
-  uint32_t n = tilingGm.GetValue(3);
-
-  GlobalTensor<float> tilingF;
-  tilingF.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)tiling_ptr + 16), 1);
-  float filler = tilingF.GetValue(0);
-
-  KernelCsrGetDataWithWeights<int32_t> op;
-  op.Init(indptr, indices, data, rows, cols, weights, out,
-          numRows, numCols, nnz, n, filler);
-  op.Process();
+// Floating values are transferred as integer bits. This supports float64
+// without unsupported FP64 arithmetic, preserving filler/weight bit patterns.
+#define GET_DATA_ENTRY(NAME, ID, OUT, WEIGHTED)                               \
+extern "C" __global__ __aicore__ void NAME(                                  \
+    GM_ADDR ptr, GM_ADDR idx, GM_ADDR data, GM_ADDR rows, GM_ADDR cols,         \
+    GM_ADDR weights, GM_ADDR out, uint32_t num_rows, uint64_t num_cols,        \
+    uint64_t count, uint32_t row_stride, uint32_t col_stride,                  \
+    uint32_t has_data, uint32_t sorted, uint64_t filler) {                     \
+  TPipe pipe;                                                                \
+  KernelLookup<ID, OUT, WEIGHTED> op;                                         \
+  op.Init(ptr, idx, data, rows, cols, weights, out, num_rows, num_cols, count,   \
+          row_stride, col_stride, has_data, sorted, filler, &pipe);            \
+  op.Process();                                                              \
 }
-
-extern "C" __global__ __aicore__ void csr_get_data_weighted_int64(
-    GM_ADDR indptr, GM_ADDR indices, GM_ADDR data,
-    GM_ADDR rows, GM_ADDR cols, GM_ADDR weights,
-    GM_ADDR out, GM_ADDR tiling_ptr) {
-  GlobalTensor<uint32_t> tilingGm;
-  tilingGm.SetGlobalBuffer((__gm__ uint32_t *)tiling_ptr, 5);
-  uint32_t numRows = tilingGm.GetValue(0);
-  uint32_t numCols = tilingGm.GetValue(1);
-  uint32_t nnz = tilingGm.GetValue(2);
-  uint32_t n = tilingGm.GetValue(3);
-
-  GlobalTensor<float> tilingF;
-  tilingF.SetGlobalBuffer((__gm__ float *)((__gm__ uint8_t *)tiling_ptr + 16), 1);
-  float filler = tilingF.GetValue(0);
-
-  KernelCsrGetDataWithWeights<int64_t> op;
-  op.Init(indptr, indices, data, rows, cols, weights, out,
-          numRows, numCols, nnz, n, filler);
-  op.Process();
-}
-
+GET_DATA_ENTRY(csr_get_data_int32, int32_t, int32_t, false)
+GET_DATA_ENTRY(csr_get_data_int64, int64_t, int64_t, false)
+GET_DATA_ENTRY(csr_get_data_weighted_int32, int32_t, int32_t, true)
+GET_DATA_ENTRY(csr_get_data_weighted_int64, int64_t, int32_t, true)
+GET_DATA_ENTRY(csr_get_data_weighted_f64_int32, int32_t, int64_t, true)
+GET_DATA_ENTRY(csr_get_data_weighted_f64_int64, int64_t, int64_t, true)
+#undef GET_DATA_ENTRY
