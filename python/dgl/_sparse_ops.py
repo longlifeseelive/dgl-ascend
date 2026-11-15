@@ -2,6 +2,8 @@
 # pylint: disable= invalid-name
 from __future__ import absolute_import
 
+import sys
+
 from . import backend as F, ndarray as nd
 from ._ffi.function import _init_api
 from .base import DGLError
@@ -971,6 +973,18 @@ def _csrmask(A, A_weights, B):
     B_weights : Tensor
         The output weights.
     """
+    # CSRGetData only: retain CSRMask's existing autograd and format fallback.
+    if F.backend_name == "pytorch" and "torch_npu" in sys.modules:
+        torch = sys.modules.get("torch")
+        if torch is not None and A_weights.device.type == "npu":
+            try:
+                lookup = torch.ops.dgl_ascend._try_csr_get_data_mask
+            except AttributeError:
+                lookup = None
+            if lookup is not None:
+                result = lookup(A.handle.value, A_weights, B.handle.value)
+                if result is not None:
+                    return result
     return F.from_dgl_nd(_CAPI_DGLCSRMask(A, F.to_dgl_nd(A_weights), B))
 
 

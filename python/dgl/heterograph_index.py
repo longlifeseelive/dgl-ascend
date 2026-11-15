@@ -596,6 +596,18 @@ class HeteroGraphIndex(ObjectBase):
         Tensor
             The edge ids.
         """
+        # CSRGetData only: unsupported formats keep the original dispatch.
+        if F.backend_name == "pytorch" and "torch_npu" in sys.modules:
+            torch = sys.modules.get("torch")
+            if torch is not None and u.device.type == "npu" and v.device.type == "npu":
+                try:
+                    lookup = torch.ops.dgl_ascend._try_csr_get_data_graph
+                except AttributeError:
+                    lookup = None
+                if lookup is not None:
+                    eid = lookup(self.handle.value, int(etype), u, v, u, True, 0.)
+                    if eid is not None:
+                        return eid
         eid = F.from_dgl_nd(
             _CAPI_DGLHeteroEdgeIdsOne(
                 self, int(etype), F.to_dgl_nd(u), F.to_dgl_nd(v)

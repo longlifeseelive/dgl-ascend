@@ -25,10 +25,13 @@ from pathlib import Path
 
 import dgl
 from dgl import _sparse_ops
+from dgl import heterograph_index
 import torch
 import torch_npu  # noqa: F401
 
 ETYPE = ("_U", "_E", "_V")
+INTERFACE = "graph"
+TARGET_RATIO = .8
 
 
 @dataclass(frozen=True)
@@ -107,7 +110,7 @@ def make_inputs(case, dtype=torch.int32, data_kind="identity", weight_dtype=torc
     return tuple(t.to(dtype) for t in (p,j,a,r,c)) + (weights,)
 
 
-def make_runner(case, values, device):
+def make_runner(case, values, device, interface=None):
     p,j,a,r,c,w = (t.to(device) for t in values)
     graph = dgl.heterograph({ETYPE:("csr",(p,j,a))},
                             num_nodes_dict={"_U":case.rows,"_V":case.cols},
@@ -128,6 +131,24 @@ def make_runner(case, values, device):
     else:
         def run():
             return graph._graph.edge_ids_one(0,r,c)
+    if (interface or INTERFACE) == "native" and torch.device(device).type == "npu":
+        def run():
+            if case.weighted:
+                result=torch.ops.dgl_ascend._try_csr_get_data_mask(
+                    int(graph._graph.handle.value),w,int(query_graph._graph.handle.value))
+                if result is None:raise RuntimeError("Native CSRMask format guard rejected input")
+                return result
+            return torch.ops.dgl_ascend._csr_get_data_graph(
+                int(graph._graph.handle.value),0,r,c,w,not case.weighted,0.)
+    if (interface or INTERFACE) == "ffi" and torch.device(device).type == "npu":
+        def run():
+            if case.weighted:
+                answer=_sparse_ops._CAPI_DGLCSRMask(
+                    graph._graph,dgl.backend.to_dgl_nd(w),query_graph._graph)
+            else:
+                answer=heterograph_index._CAPI_DGLHeteroEdgeIdsOne(
+                    graph._graph,0,dgl.backend.to_dgl_nd(r),dgl.backend.to_dgl_nd(c))
+            return dgl.backend.from_dgl_nd(answer)
     return run, (graph,query_graph,p,j,a,r,c,w)
 
 
@@ -140,6 +161,54 @@ def exact_check(actual, expected):
 
 
 class TestCSRGetDataNPU(unittest.TestCase):
+    def test_graph_format_fallbacks(self):
+        case=Case("formats",7,17,23,37,False)
+        for dtype in (torch.int32,torch.int64):
+            values=make_inputs(case,dtype,"random")
+            for fmt in ("csr","coo","csc"):
+                with self.subTest(dtype=dtype,format=fmt):
+                    _,owners=make_runner(case,values,"cpu")
+                    cpu=owners[0].formats(fmt)
+                    npu=cpu.to("npu:0")
+                    r,c=values[3][::2].contiguous(),values[4][::2].contiguous()
+                    expected=cpu._graph.edge_ids_one(0,r,c)
+                    actual=npu._graph.edge_ids_one(0,r.to("npu:0"),c.to("npu:0"))
+                    exact_check(actual,expected)
+                    self.assertEqual(npu.formats(),cpu.formats())
+
+    def test_native_graph_contract(self):
+        for dtype in (torch.int32,torch.int64):
+            for weighted in (False,True):
+                case=Case("native_contract",7,17,23,37,weighted)
+                values=make_inputs(case,dtype,"random",torch.float64)
+                cpu,_=make_runner(case,values,"cpu")
+                native,owners=make_runner(case,values,"npu:0",interface="native")
+                graph_api,_=make_runner(case,values,"npu:0",interface="graph")
+                expected=cpu()
+                exact_check(native(),expected)
+                exact_check(graph_api(),expected)
+                if weighted:
+                    g,_,_,_,_,r,c,w=owners
+                    with self.assertRaisesRegex(RuntimeError,"autograd"):
+                        torch.ops.dgl_ascend._csr_get_data_graph(
+                            int(g._graph.handle.value),0,r,c,w.detach().requires_grad_(),False,0.)
+
+    def test_native_heterogeneous_relation(self):
+        dtype=torch.int64
+        specs={('u','a','v'):('csr',(torch.tensor([0,1,1],dtype=dtype),
+               torch.tensor([1],dtype=dtype),torch.tensor([0],dtype=dtype))),
+               ('u','z','v'):('csr',(torch.tensor([0,1,2],dtype=dtype),
+               torch.tensor([5,3],dtype=dtype),torch.tensor([1,0],dtype=dtype)))}
+        cpu=dgl.heterograph(specs,num_nodes_dict={'u':2,'v':7},idtype=dtype)
+        npu=cpu.to('npu:0')
+        r=torch.tensor([0,1,0],dtype=dtype);c=torch.tensor([5,3,2],dtype=dtype)
+        etype=cpu.get_etype_id(('u','z','v'))
+        expected=cpu._graph.edge_ids_one(etype,r,c)
+        actual=torch.ops.dgl_ascend._csr_get_data_graph(
+            int(npu._graph.handle.value),etype,r.to('npu:0'),c.to('npu:0'),
+            torch.empty(0,device='npu:0'),True,0.)
+        exact_check(actual,expected)
+
     def test_functional_matrix(self):
         count = 0
         for case in PERF_CASES + EXTRA_CASES:
@@ -305,14 +374,17 @@ def performance(case, warmup, repeat, rounds, dtype=torch.int32,
     print(f"PERF {case.name} {dtype} {data_kind} weighted={case.weighted}/{weight_dtype} "
           f"correct={correct} mean_ms={mean:.6f} rounds={times}",flush=True)
     return dict(case=case.name,rows=case.rows,cols=case.cols,nnz=case.nnz,
+                interface=INTERFACE,target_ratio=TARGET_RATIO,
                 queries=case.queries,weighted=case.weighted,dtype=str(dtype).split('.')[-1],
                 weight_dtype=str(weight_dtype).split('.')[-1] if case.weighted else None,
                 data=data_kind,hit_fraction=((case.queries+1)//2/case.queries
                     if case.nnz and case.queries else 0.),correct=correct,error=error,
                 input_sha256=digest.hexdigest(),round_ms=times,npu_ms=mean,
                 a100_ms=case.a100_ms,ratio=case.a100_ms/mean if case.a100_ms else None,
-                limit_ms=case.a100_ms/.3 if case.a100_ms else None,
-                passes_03=(correct and mean<=case.a100_ms/.3) if case.a100_ms else None)
+                limit_ms=case.a100_ms/TARGET_RATIO if case.a100_ms else None,
+                passes_target=(correct and mean<=case.a100_ms/TARGET_RATIO) if case.a100_ms else None,
+                passes_03=(correct and mean<=case.a100_ms/.3) if case.a100_ms else None,
+                passes_08=(correct and mean<=case.a100_ms/.8) if case.a100_ms else None)
 
 
 def main():
@@ -326,9 +398,14 @@ def main():
     parser.add_argument("--repeat",type=int,default=100)
     parser.add_argument("--rounds",type=int,default=3)
     parser.add_argument("--output",type=Path)
+    parser.add_argument("--interface",choices=("graph","native","ffi"),default="graph")
+    parser.add_argument("--target-ratio",type=float,default=.8)
     parser.add_argument("--msprof-output",type=Path,default=Path("/tmp/csr_get_data_prof"))
     args=parser.parse_args()
-    if args.warmup<0 or args.repeat<1 or args.rounds<1:parser.error("Invalid repetition counts")
+    if args.warmup<0 or args.repeat<1 or args.rounds<1 or args.target_ratio<=0:
+        parser.error("Invalid repetition counts or target ratio")
+    global INTERFACE,TARGET_RATIO
+    INTERFACE,TARGET_RATIO=args.interface,args.target_ratio
     torch.npu.set_device(0)
     cases=(list(PERF_CASES + EXTRA_CASES) if args.extended and args.perf_case=="all"
            else list(PERF_CASES) if args.perf_case=="all" else [CASES[args.perf_case]])
@@ -338,10 +415,15 @@ def main():
                             "--ascendcl=on","--runtime-api=on","--task-time=l2","--ai-core=on",
                             "--aic-metrics=PipeUtilization",sys.executable,str(Path(__file__).resolve()),
                             "--performance","--perf-case",c.name,"--warmup",str(args.warmup),
-                            "--repeat",str(args.repeat),"--rounds",str(args.rounds)],check=True)
+                            "--repeat",str(args.repeat),"--rounds",str(args.rounds),
+                            "--interface",args.interface,"--target-ratio",str(args.target_ratio)],check=True)
     elif args.performance or args.extended:
         library=Path(dgl._ffi.base._LIB._name).resolve()
         report=dict(warmup=args.warmup,repeat=args.repeat,rounds=args.rounds,
+                    interface=INTERFACE,target_ratio=TARGET_RATIO,
+                    dgl_python=str(Path(dgl.__file__).resolve()),
+                    python_sha256={name:hashlib.sha256((Path(dgl.__file__).parent/name).read_bytes()).hexdigest()
+                                   for name in ("heterograph_index.py","_sparse_ops.py","_ffi/base.py")},
                     test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     library=str(library),library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),results=[])
         for c in cases:

@@ -48,6 +48,13 @@ class KernelLookup {
     pipe->InitBuffer(end_buf_, kBatch * sizeof(IdT));
     pipe->InitBuffer(mask_lo_buf_, kBatch * 32);
     pipe->InitBuffer(mask_hi_buf_, sizeof(IdT) == 8 ? kBatch * 32 : 32);
+    pipe->InitBuffer(eid_buf_, kBatch * 32);
+    pipe->InitBuffer(value_buf_, Weighted ? kBatch * 32 : 32);
+    pipe->InitBuffer(field_offsets_buf_, kBatch * sizeof(OutT));
+    if constexpr (sizeof(IdT) == 4) {
+      pipe->InitBuffer(col_seed_buf_, kBatch * 8 * sizeof(int32_t));
+      pipe->InitBuffer(batch_mask_buf_, kBatch * kRow / 8);
+    }
   }
 
   __aicore__ inline void Process() {
@@ -59,6 +66,14 @@ class KernelLookup {
     auto row_data = row_buf_.Get<IdT>();
     auto starts = start_buf_.Get<IdT>();
     auto ends = end_buf_.Get<IdT>();
+    auto eid_slots = eid_buf_.Get<IdT>();
+    auto value_slots = value_buf_.Get<OutT>();
+    auto offsets = field_offsets_buf_.Get<uint32_t>();
+    constexpr uint32_t out_words = sizeof(OutT) / 4;
+    for (uint32_t i = 0; i < kBatch; ++i) {
+      offsets.SetValue(i * out_words, i * 32);
+      if constexpr (out_words == 2) offsets.SetValue(i * out_words + 1, i * 32 + 4);
+    }
     if (cache_ptr_) {
       Load(pointers, ptr_gm_, 0, num_rows_ + 1);
       SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
@@ -74,12 +89,10 @@ class KernelLookup {
         SetFlag<HardEvent::S_MTE2>(0); WaitFlag<HardEvent::S_MTE2>(0);
         for (uint32_t i = 0; i < qn; ++i) {
           const IdT r = rows.GetValue(row_stride_ ? batch + i : 0);
-          const IdT c = cols.GetValue(col_stride_ ? batch + i : 0);
           IdT start = 0, stop = 0;
           // Valid IDs are the public contract. Guard malformed device input
           // here to prevent an out-of-range device memory access.
-          if (r >= 0 && static_cast<uint64_t>(r) < num_rows_ &&
-              c >= 0 && static_cast<uint64_t>(c) < num_cols_) {
+          if (r >= 0 && static_cast<uint64_t>(r) < num_rows_) {
             start = cache_ptr_ ? pointers.GetValue(r) : ptr_gm_.GetValue(r);
             stop = cache_ptr_ ? pointers.GetValue(r + 1) : ptr_gm_.GetValue(r + 1);
           }
@@ -93,17 +106,41 @@ class KernelLookup {
         SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
         SetFlag<HardEvent::MTE2_V>(0); WaitFlag<HardEvent::MTE2_V>(0);
         SetFlag<HardEvent::S_V>(0); WaitFlag<HardEvent::S_V>(0);
-        for (uint32_t i = 0; i < qn; ++i) {
-          const IdT degree = ends.GetValue(i) - starts.GetValue(i);
-          if (degree > 0 && !(sorted_ && degree > kRow)) {
-            MakeMask(i, cols.GetValue(col_stride_ ? batch + i : 0),
-                     degree < kRow ? degree : kRow);
+        if constexpr (sizeof(IdT) == 4) {
+          auto seed = col_seed_buf_.Get<int32_t>();
+          if (col_stride_) {
+            Brcb(seed, cols[batch], static_cast<uint8_t>((qn + 7) / 8),
+                 BrcbRepeatParams{1, 8});
+          } else {
+            Duplicate<int32_t>(seed, cols.GetValue(0), kBatch * 8);
+          }
+          PipeBarrier<PIPE_V>();
+          BinaryRepeatParams repeat;
+          repeat.src0BlkStride = 1; repeat.src1BlkStride = 0;
+          repeat.src0RepStride = kRow / 8; repeat.src1RepStride = 1;
+          auto mask = batch_mask_buf_.Get<uint8_t>();
+          Compare(mask, row_data, seed, CMPMODE::EQ, uint64_t(64),
+                  static_cast<uint8_t>(qn), repeat);
+          Compare(mask[kBatch * 8], row_data[64], seed, CMPMODE::EQ,
+                  uint64_t(64), static_cast<uint8_t>(qn), repeat);
+        } else {
+          for (uint32_t i = 0; i < qn; ++i) {
+            const IdT degree = ends.GetValue(i) - starts.GetValue(i);
+            if (degree > 0 && !(sorted_ && degree > kRow)) {
+              MakeMask(i, cols.GetValue(col_stride_ ? batch + i : 0),
+                       degree < kRow ? degree : kRow);
+            }
           }
         }
         SetFlag<HardEvent::V_S>(0); WaitFlag<HardEvent::V_S>(0);
+        Duplicate<int32_t>(eid_buf_.Get<int32_t>(), -1, kBatch * 32 / 4);
+        if constexpr (Weighted) FillValues(value_slots);
+        SetFlag<HardEvent::V_MTE2>(0); WaitFlag<HardEvent::V_MTE2>(0);
+        SetFlag<HardEvent::V_S>(0); WaitFlag<HardEvent::V_S>(0);
         for (uint32_t i = 0; i < qn; ++i) {
-          const IdT c = cols.GetValue(col_stride_ ? batch + i : 0);
           const IdT start = starts.GetValue(i), stop = ends.GetValue(i);
+          const IdT c = stop - start > kRow
+              ? cols.GetValue(col_stride_ ? batch + i : 0) : IdT(0);
           IdT found = -1;
           if (sorted_ && static_cast<uint64_t>(stop - start) > kRow) {
             // lower_bound preserves the first occurrence in a multigraph.
@@ -125,19 +162,43 @@ class KernelLookup {
                 MakeMask(i, c, take);
                 SetFlag<HardEvent::V_S>(0); WaitFlag<HardEvent::V_S>(0);
               }
-              const int32_t match = FirstMatch(i, take);
+              int32_t match;
+              if constexpr (sizeof(IdT) == 4) {
+                match = tile == start ? FirstBatchMatch(i, take) : FirstMatch(i, take);
+              } else {
+                match = FirstMatch(i, take);
+              }
               if (match >= 0) found = tile + match;
               if (found >= 0) break;
             }
           }
-          OutT value = filler_;
           if (found >= 0) {
-            const IdT eid = has_data_ ? data_gm_.GetValue(found) : found;
-            if constexpr (Weighted) value = weights_gm_.GetValue(eid);
-            else value = static_cast<OutT>(eid);
+            if (has_data_) {
+              Load(eid_slots[i * (32 / sizeof(IdT))], data_gm_, found, 1);
+            } else {
+              eid_slots.SetValue(i * (32 / sizeof(IdT)), found);
+            }
           }
-          result.SetValue(batch + i, value);
         }
+        SetFlag<HardEvent::MTE2_S>(0); WaitFlag<HardEvent::MTE2_S>(0);
+        if constexpr (Weighted) {
+          for (uint32_t i = 0; i < qn; ++i) {
+            const IdT eid = eid_slots.GetValue(i * (32 / sizeof(IdT)));
+            if (eid >= 0) {
+              Load(value_slots[i * (32 / sizeof(OutT))], weights_gm_, eid, 1);
+            }
+          }
+        }
+        SetFlag<HardEvent::MTE2_V>(0); WaitFlag<HardEvent::MTE2_V>(0);
+        SetFlag<HardEvent::S_V>(0); WaitFlag<HardEvent::S_V>(0);
+        if constexpr (Weighted) {
+          Gather(result.template ReinterpretCast<int32_t>()[batch * out_words],
+                 value_slots.template ReinterpretCast<int32_t>(), offsets, 0, qn * out_words);
+        } else {
+          Gather(result.template ReinterpretCast<int32_t>()[batch * out_words],
+                 eid_slots.template ReinterpretCast<int32_t>(), offsets, 0, qn * out_words);
+        }
+        SetFlag<HardEvent::V_S>(0); WaitFlag<HardEvent::V_S>(0);
       }
       SetFlag<HardEvent::S_MTE3>(0); WaitFlag<HardEvent::S_MTE3>(0);
       DataCopyExtParams cp{1, static_cast<uint32_t>(n * sizeof(OutT)), 0, 0, 0};
@@ -146,6 +207,31 @@ class KernelLookup {
     }
   }
  private:
+  template <typename T>
+  __aicore__ inline void FillValues(LocalTensor<T> buffer) {
+    constexpr uint32_t nwords = kBatch * 32 / 4;
+    auto words = buffer.template ReinterpretCast<int32_t>();
+    Duplicate<int32_t>(words, static_cast<int32_t>(filler_), nwords);
+    if constexpr (sizeof(T) == 8) {
+      PipeBarrier<PIPE_V>();
+      uint64_t mask[1] = {0xAAAAAAAAAAAAAAAAULL};
+      Duplicate<int32_t>(words,
+          static_cast<int32_t>(static_cast<uint64_t>(filler_) >> 32),
+          mask, nwords / 64, 1, 8);
+    }
+  }
+  __aicore__ inline int32_t FirstBatchMatch(uint32_t slot, uint32_t take) {
+    auto mask = batch_mask_buf_.Get<uint64_t>();
+    uint64_t bits = mask.GetValue(slot);
+    if (take < 64) bits &= (uint64_t(1) << take) - 1;
+    if (bits) return static_cast<int32_t>(GetSFFValue<1>(bits));
+    if (take > 64) {
+      bits = mask.GetValue(kBatch + slot);
+      if (take < 128) bits &= (uint64_t(1) << (take - 64)) - 1;
+      if (bits) return 64 + static_cast<int32_t>(GetSFFValue<1>(bits));
+    }
+    return -1;
+  }
   template <uint32_t Width>
   __aicore__ inline void CompareRow(uint32_t slot, IdT col) {
     constexpr uint32_t words = sizeof(IdT) / 4;
@@ -185,6 +271,8 @@ class KernelLookup {
   TBuf<TPosition::VECCALC> ptr_buf_, rows_buf_, cols_buf_, out_buf_, row_buf_;
   TBuf<TPosition::VECCALC> start_buf_, end_buf_;
   TBuf<TPosition::VECCALC> mask_lo_buf_, mask_hi_buf_;
+  TBuf<TPosition::VECCALC> col_seed_buf_, batch_mask_buf_;
+  TBuf<TPosition::VECCALC> eid_buf_, value_buf_, field_offsets_buf_;
   uint64_t num_cols_, count_, begin_, end_;
   uint32_t num_rows_, row_stride_, col_stride_, has_data_, sorted_;
   bool cache_ptr_;
