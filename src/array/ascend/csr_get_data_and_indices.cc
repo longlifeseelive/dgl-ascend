@@ -1,11 +1,15 @@
 #ifdef DGL_USE_PYTORCH_NPU_STREAM
 #include <ATen/ATen.h>
 #include <ATen/record_function.h>
+#include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUFunctions.h>
 #include <torch_npu/csrc/core/npu/NPUGuard.h>
+#include "../../graph/heterograph.h"
 #endif
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -93,8 +97,14 @@ struct Completion {
 #endif
 }  // namespace
 
-template <DGLDeviceType XPU, typename IdType>
-std::vector<NDArray> CSRGetDataAndIndices(CSRMatrix csr, NDArray rows, NDArray cols) {
+namespace {
+using AllAllocator = std::function<NDArray(int64_t, DGLDataType, DGLContext)>;
+
+// Both DGL's packed entry and the tensor graph entry use this implementation.
+// Only the output allocator differs; matching and compaction stay on the NPU.
+template <typename IdType>
+std::vector<NDArray> AllMatches(CSRMatrix csr, NDArray rows, NDArray cols,
+                              const AllAllocator& allocate = NewAllArray) {
 #ifdef DGL_USE_ASCEND
 #ifdef DGL_USE_PYTORCH_NPU_STREAM
   RECORD_FUNCTION("dgl::CSRGetDataAndIndices[Ascend]", std::vector<c10::IValue>());
@@ -108,9 +118,9 @@ std::vector<NDArray> CSRGetDataAndIndices(CSRMatrix csr, NDArray rows, NDArray c
   // The CPU loop also produces no queries when one broadcast operand is empty.
   const int64_t queries = nr == 0 || nc == 0 ? 0 : std::max(nr, nc);
   auto empty = [&]() {
-    return std::vector<NDArray>{NewAllArray(0, rows->dtype, ctx),
-                               NewAllArray(0, rows->dtype, ctx),
-                               NewAllArray(0, rows->dtype, ctx)};
+    return std::vector<NDArray>{allocate(0, rows->dtype, ctx),
+                               allocate(0, rows->dtype, ctx),
+                               allocate(0, rows->dtype, ctx)};
   };
   if (!queries) return empty();
   int32_t current = -1; ALL_ACL(aclrtGetDevice(&current));
@@ -152,7 +162,7 @@ std::vector<NDArray> CSRGetDataAndIndices(CSRMatrix csr, NDArray rows, NDArray c
   CHECK_LE(total, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
       << "CSRGetDataAndIndices output size overflow";
   if (!total) return empty();
-  for (int i = 0; i < 3; ++i) result.push_back(NewAllArray(total, rows->dtype, ctx));
+  for (int i = 0; i < 3; ++i) result.push_back(allocate(total, rows->dtype, ctx));
   completion.pending = true;
 #define EMIT(SUFFIX) \
   ALL_ACL(aclrtlaunch_csr_all_emit_##SUFFIX(cores, stream, Data(csr.indices), \
@@ -167,8 +177,82 @@ std::vector<NDArray> CSRGetDataAndIndices(CSRMatrix csr, NDArray rows, NDArray c
   LOG(FATAL) << "Ascend support is not compiled."; return {};
 #endif
 }
+}  // namespace
+
+template <DGLDeviceType XPU, typename IdType>
+std::vector<NDArray> CSRGetDataAndIndices(CSRMatrix csr, NDArray rows, NDArray cols) {
+  return AllMatches<IdType>(csr, rows, cols);
+}
 template std::vector<NDArray> CSRGetDataAndIndices<kDGLAscend, int32_t>(CSRMatrix, NDArray, NDArray);
 template std::vector<NDArray> CSRGetDataAndIndices<kDGLAscend, int64_t>(CSRMatrix, NDArray, NDArray);
+
+#ifdef DGL_USE_PYTORCH_NPU_STREAM
+namespace {
+// The dispatcher retains input tensors throughout this synchronous operation.
+NDArray BorrowAllTensor(const at::Tensor& tensor) {
+  auto container = std::make_unique<NDArray::Container>();
+  container->dl_tensor.data = tensor.data_ptr();
+  container->dl_tensor.ctx = {kDGLAscend, tensor.device().index()};
+  container->dl_tensor.dtype = {kDGLInt,
+      static_cast<uint8_t>(tensor.element_size() * 8), 1};
+  container->dl_tensor.ndim = 1;
+  container->dl_tensor.shape = new int64_t[1]{tensor.numel()};
+  container->deleter = [](NDArray::Container* self) {
+    delete[] self->dl_tensor.shape;
+    delete self;
+  };
+  return NDArray(container.release());
+}
+}  // namespace
+
+// Empty vector means unsupported: preserve the ordinary DGL format-selection
+// path without materializing formats or modifying the graph. A supported empty
+// query returns three empty tensors, which is distinct from this sentinel.
+std::vector<at::Tensor> TryGraphCSRGetDataAndIndices(
+    int64_t handle, int64_t etype, const at::Tensor& rows,
+    const at::Tensor& cols) {
+  if (!handle || rows.device().type() != c10::DeviceType::PrivateUse1 ||
+      cols.device() != rows.device() || rows.dim() != 1 || cols.dim() != 1 ||
+      !rows.is_contiguous() || !cols.is_contiguous() ||
+      (rows.scalar_type() != at::kInt && rows.scalar_type() != at::kLong) ||
+      cols.scalar_type() != rows.scalar_type()) return {};
+  auto* holder = reinterpret_cast<std::shared_ptr<runtime::Object>*>(
+      static_cast<uintptr_t>(handle));
+  auto owner = std::dynamic_pointer_cast<BaseHeteroGraph>(*holder);
+  if (!owner || etype < 0 || etype >= owner->NumEdgeTypes() ||
+      owner->Context().device_type != kDGLAscend) return {};
+  auto unit = std::dynamic_pointer_cast<UnitGraph>(owner);
+  if (!unit) {
+    auto hetero = std::dynamic_pointer_cast<HeteroGraph>(owner);
+    if (!hetero) return {};
+    unit = std::dynamic_pointer_cast<UnitGraph>(
+        hetero->GetRelationGraph(static_cast<dgl_type_t>(etype)));
+  }
+  if (!unit || !(unit->GetCreatedFormats() & CSR_CODE) ||
+      !(unit->GetAllowedFormats() & CSR_CODE) ||
+      unit->SelectFormat(0, CSR_CODE) != SparseFormat::kCSR) return {};
+  const auto csr = unit->GetCSRMatrix(0);
+  if (csr.indptr->ctx.device_id != rows.device().index() ||
+      csr.indptr->dtype.bits != rows.element_size() * 8) return {};
+  const c10_npu::NPUGuard guard(rows.device());
+  TORCH_CHECK(c10_npu::npuSynchronizeDevice(true),
+              "CSRGetDataAndIndices producer synchronization failed");
+  std::vector<at::Tensor> tensors;
+  tensors.reserve(3);
+  const AllAllocator allocate = [&](int64_t n, DGLDataType, DGLContext) {
+    const int64_t offset = 512 / rows.element_size();
+    TORCH_CHECK(n <= std::numeric_limits<int64_t>::max() - offset,
+                "CSRGetDataAndIndices output size overflow");
+    auto storage = at::empty({n + offset}, rows.options().requires_grad(false));
+    tensors.push_back(storage.narrow(0, offset, n));
+    return BorrowAllTensor(tensors.back());
+  };
+  auto r = BorrowAllTensor(rows), c = BorrowAllTensor(cols);
+  if (rows.scalar_type() == at::kInt) AllMatches<int32_t>(csr, r, c, allocate);
+  else AllMatches<int64_t>(csr, r, c, allocate);
+  return tensors;
+}
+#endif
 }  // namespace impl
 
 // Operator-scoped diagnostic entry for sorted metadata and standalone CSR
@@ -187,3 +271,13 @@ DGL_REGISTER_GLOBAL("ascend._CAPI_DGLCSRGetDataAndIndices")
 });
 }  // namespace aten
 }  // namespace dgl
+
+#ifdef DGL_USE_PYTORCH_NPU_STREAM
+TORCH_LIBRARY_FRAGMENT(dgl_ascend, m) {
+  m.def(torch::schema(
+      "_try_csr_get_data_and_indices_graph(int graph_handle, int etype, "
+      "Tensor rows, Tensor cols) -> Tensor[]",
+      c10::AliasAnalysisKind::CONSERVATIVE),
+      TORCH_FN(dgl::aten::impl::TryGraphCSRGetDataAndIndices));
+}
+#endif

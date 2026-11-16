@@ -569,6 +569,23 @@ class HeteroGraphIndex(ObjectBase):
         Tensor
             The edge ids.
         """
+        # CSRGetDataAndIndices only: borrow tensor queries and return the three
+        # framework-owned outputs directly. Unsupported formats/strides retain
+        # the original DGL path and its format restrictions.
+        if F.backend_name == "pytorch" and "torch_npu" in sys.modules:
+            torch = sys.modules.get("torch")
+            if torch is not None and u.device.type == "npu" and v.device.type == "npu":
+                try:
+                    lookup = torch.ops.dgl_ascend._try_csr_get_data_and_indices_graph
+                except AttributeError:
+                    lookup = None
+                if lookup is not None:
+                    try:
+                        result = lookup(self.handle.value, int(etype), u, v)
+                    except RuntimeError as exc:
+                        raise DGLError(str(exc)) from exc
+                    if result:
+                        return tuple(result)
         edge_array = _CAPI_DGLHeteroEdgeIdsAll(
             self, int(etype), F.to_dgl_nd(u), F.to_dgl_nd(v)
         )

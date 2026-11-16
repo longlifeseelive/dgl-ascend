@@ -277,6 +277,65 @@ class TestCSRGetDataAndIndicesNPU(unittest.TestCase):
                 exact(npu.edge_ids(r.to('npu:0'),c.to('npu:0'),return_uv=True,etype=etype),
                       cpu.edge_ids(r,c,return_uv=True,etype=etype))
 
+    def test_tensor_entry_producer_and_format_guards(self):
+        lookup = torch.ops.dgl_ascend._try_csr_get_data_and_indices_graph
+        for dtype in ID_DTYPES:
+            case = Case('producer', 17, 257, 2053, 129)
+            values = make_inputs(case, dtype, 'random')
+            run, owners = runner(case, values, 'npu:0')
+            graph, p, j, a, rows, cols = owners
+            handle = graph._graph.handle.value
+            changed = (values[0], (values[1] + 1).remainder(case.cols),
+                       values[2].flip(0), values[3], values[4])
+            cpu, _ = runner(case, changed, 'cpu')
+            expected = cpu()
+            target_j, target_a = (x.to('npu:0') for x in changed[1:3])
+            torch.npu.synchronize()
+            producer = torch.npu.Stream()
+            delay = torch.ones(1024 * 1024, device='npu:0')
+            with torch.npu.stream(producer):
+                for _ in range(8):
+                    delay.add_(1)
+                j.copy_(target_j)
+                a.copy_(target_a)
+                ready = torch.npu.Event()
+                ready.record(producer)
+            # No generic FFI call between producer submission and this entry.
+            actual = lookup(handle, 0, rows, cols)
+            self.assertTrue(ready.query())
+            exact(actual, expected)
+            # A rejected shortcut must leave graph format state unchanged.
+            for fmt in ('coo', 'csc'):
+                other = graph.formats(fmt)
+                before = other.formats()
+                self.assertEqual(lookup(other._graph.handle.value, 0, rows, cols), [])
+                self.assertEqual(other.formats(), before)
+            strided = rows.repeat_interleave(2)[::2]
+            self.assertEqual(lookup(handle, 0, strided, cols), [])
+            empty = rows[:0]
+            result = lookup(handle, 0, empty, empty)
+            self.assertEqual(len(result), 3)
+            self.assertTrue(all(x.numel() == 0 for x in result))
+
+    def test_output_storage_on_consumer_stream(self):
+        for dtype in ID_DTYPES:
+            case = Case('consumer', 257, 509, 8193, 257)
+            values = make_inputs(case, dtype, 'random')
+            cpu, _ = runner(case, values, 'cpu')
+            expected = cpu()
+            run, owners = runner(case, values, 'npu:0')
+            result = run()
+            consumer = torch.npu.Stream()
+            with torch.npu.stream(consumer):
+                for value in result:
+                    value.record_stream(consumer)
+                copies = tuple(value.clone() for value in result)
+            del value, result, run, owners
+            gc.collect()
+            torch.npu.empty_cache()
+            consumer.synchronize()
+            exact(copies, expected)
+
 
 def _run_performance_case(perf_name, warmup, repeat):
     """Time the public all-edge query, using CSRToCOO's output protocol."""
