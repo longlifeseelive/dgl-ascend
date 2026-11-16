@@ -1,8 +1,9 @@
-"""CSRGetData exact correctness and full DGL graph-API NPU performance.
+"""CSRGetData correctness and msprof performance tests on Ascend NPU.
 
     python tests/ascend/test_csr_get_data_npu.py
-    python tests/ascend/test_csr_get_data_npu.py --performance --output results.json
-    python tests/ascend/test_csr_get_data_npu.py --run-msprof --msprof-output /tmp/csr_get_data_prof
+    python tests/ascend/test_csr_get_data_npu.py --performance --perf-case typical_eids
+    python tests/ascend/test_csr_get_data_npu.py --run-msprof --msprof-output ./msprof_csr_get_data
+    python tests/ascend/test_csr_get_data_npu.py --generalization --general-output /tmp/csr_get_data_general.json
 
 EID calls graph._graph.edge_ids_one (supports missing edges); weights call
 _sparse_ops._csrmask, whose CSRMask implementation dispatches CSRGetData.
@@ -22,16 +23,30 @@ import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import dgl
 from dgl import _sparse_ops
 from dgl import heterograph_index
 import torch
-import torch_npu  # noqa: F401
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
 
 ETYPE = ("_U", "_E", "_V")
 INTERFACE = "graph"
-TARGET_RATIO = .8
+
+
+def _npu_is_available() -> bool:
+    try:
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except RuntimeError:
+        return False
+
+
+NPU_AVAILABLE = _npu_is_available()
+ID_DTYPES = (torch.int32, torch.int64)
 
 
 @dataclass(frozen=True)
@@ -62,6 +77,8 @@ EXTRA_CASES = (
     Case("large_batch", 1009, 1031, 65539, 131073, True),
 )
 CASES = {c.name:c for c in PERF_CASES + EXTRA_CASES}
+GENERALIZATION_CASES = PERF_CASES + EXTRA_CASES
+PERFORMANCE_CASES = {case.name: case for case in PERF_CASES}
 
 
 def balanced(m, e):
@@ -160,6 +177,7 @@ def exact_check(actual, expected):
         raise AssertionError(f"Output differs from CPU reference ({mismatch} entries)")
 
 
+@unittest.skipUnless(NPU_AVAILABLE, "Ascend NPU is required")
 class TestCSRGetDataNPU(unittest.TestCase):
     def test_invalid_indices_and_broadcast_errors(self):
         packed=dgl._ffi.function.get_global_func("ascend._CAPI_DGLCSRGetData")
@@ -269,7 +287,6 @@ class TestCSRGetDataNPU(unittest.TestCase):
         exact_check(actual,expected)
 
     def test_functional_matrix(self):
-        count = 0
         for case in PERF_CASES + EXTRA_CASES:
             for dtype in (torch.int32,torch.int64):
                 for data in ("none","identity","reverse","random"):
@@ -282,11 +299,8 @@ class TestCSRGetDataNPU(unittest.TestCase):
                                 cpu,_ = make_runner(custom,values,"cpu")
                                 npu,_ = make_runner(custom,values,"npu:0")
                                 exact_check(npu(),cpu())
-                                count += 1
-        print(f"FUNCTIONAL_CHECKS {count}",flush=True)
 
     def test_broadcast_duplicates_and_mutation(self):
-        count = 0
         for dtype in (torch.int32,torch.int64):
             for weighted in (False,True):
                 case = Case("duplicates",3,17,7,7,weighted)
@@ -299,19 +313,18 @@ class TestCSRGetDataNPU(unittest.TestCase):
                     values=(p,j,a,torch.tensor(r,dtype=dtype),torch.tensor(c,dtype=dtype),w)
                     cpu,_=make_runner(case,values,"cpu")
                     npu,owners=make_runner(case,values,"npu:0")
-                    exact_check(npu(),cpu());count+=1
+                    exact_check(npu(),cpu())
                     # Reuse the same graph and input addresses with changed data/weights.
                     owners[4].copy_(a.flip(0).to("npu:0"))
                     owners[-1].add_(2.)
                     changed=(p,j,a.flip(0),values[3],values[4],w+2.)
                     cpu,_=make_runner(case,changed,"cpu")
                     result=npu()
-                    exact_check(result,cpu());count+=1
+                    exact_check(result,cpu())
                     del npu,owners
                     gc.collect()
                     torch.npu.empty_cache()
                     exact_check(result,cpu())
-        print(f"BROADCAST_MUTATION_CHECKS {count}",flush=True)
 
     def test_noncurrent_producer(self):
         case=Case("stream",127,257,2049,1027,True)
@@ -327,7 +340,6 @@ class TestCSRGetDataNPU(unittest.TestCase):
 
     def test_sparse_matrix_sorted_and_fillers(self):
         packed=dgl._ffi.function.get_global_func("ascend._CAPI_DGLCSRGetData")
-        checks=0
         for dtype in (torch.int32,torch.int64):
             for sorted_cols in (False,True):
                 for wtype in (torch.float32,torch.float64):
@@ -344,8 +356,7 @@ class TestCSRGetDataNPU(unittest.TestCase):
                             answer=packed(matrix,dgl.backend.to_dgl_nd(rr),
                                 dgl.backend.to_dgl_nd(cc),False,dgl.backend.to_dgl_nd(ww),-7.123456789)
                             return dgl.backend.from_dgl_nd(answer)
-                        exact_check(invoke("npu:0"),invoke("cpu"));checks+=1
-        print(f"SORTED_FILLER_CHECKS {checks}",flush=True)
+                        exact_check(invoke("npu:0"),invoke("cpu"))
 
     def test_int64_high_columns_and_special_weights(self):
         packed=dgl._ffi.function.get_global_func("ascend._CAPI_DGLCSRGetData")
@@ -406,104 +417,235 @@ class TestCSRGetDataNPU(unittest.TestCase):
                 exact_check(invoke("npu:0"),invoke("cpu"))
 
 
-def performance(case, warmup, repeat, rounds, dtype=torch.int32,
-                data_kind="identity", weight_dtype=torch.float32):
-    values=make_inputs(case,dtype,data_kind,weight_dtype)
-    cpu,_=make_runner(case,values,"cpu")
-    expected=cpu()
-    run,owners=make_runner(case,values,"npu:0")
-    digest=hashlib.sha256()
-    for t in values:
-        digest.update(t.numpy().tobytes())
-    correct=True; error=None
-    try:
-        exact_check(run(),expected)
-    except AssertionError as exc:
-        correct=False;error=str(exc)
-    times=[]
-    for _ in range(rounds):
-        for _ in range(warmup):run()
-        torch.npu.synchronize()
-        start=time.perf_counter()
-        for _ in range(repeat):result=run()
-        torch.npu.synchronize()
-        times.append((time.perf_counter()-start)*1000/repeat)
-        del result
-    mean=sum(times)/len(times)
-    print(f"PERF {case.name} {dtype} {data_kind} weighted={case.weighted}/{weight_dtype} "
-          f"correct={correct} mean_ms={mean:.6f} rounds={times}",flush=True)
-    return dict(case=case.name,rows=case.rows,cols=case.cols,nnz=case.nnz,
-                interface=INTERFACE,target_ratio=TARGET_RATIO,
-                queries=case.queries,weighted=case.weighted,dtype=str(dtype).split('.')[-1],
-                weight_dtype=str(weight_dtype).split('.')[-1] if case.weighted else None,
-                data=data_kind,hit_fraction=((case.queries+1)//2/case.queries
-                    if case.nnz and case.queries else 0.),correct=correct,error=error,
-                input_sha256=digest.hexdigest(),round_ms=times,npu_ms=mean,
-                a100_ms=case.a100_ms,ratio=case.a100_ms/mean if case.a100_ms else None,
-                limit_ms=case.a100_ms/TARGET_RATIO if case.a100_ms else None,
-                passes_target=(correct and mean<=case.a100_ms/TARGET_RATIO) if case.a100_ms else None,
-                passes_03=(correct and mean<=case.a100_ms/.3) if case.a100_ms else None,
-                passes_08=(correct and mean<=case.a100_ms/.8) if case.a100_ms else None)
+def _run_performance_case(perf_name, warmup, repeat, *, native=False):
+    """Run one isolated int32 workload, using CSRToCOO's timing boundaries."""
+    if not NPU_AVAILABLE:
+        raise RuntimeError("Ascend NPU is not available")
+    case = CASES[perf_name]
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    values = make_inputs(case, torch.int32)
+    run, owners = make_runner(case, values, device,
+                              interface="native" if native else "graph")
+    prefix = "NATIVE" if native else "PERF"
+    print(f"{prefix}_CONFIG name={perf_name} shape=({case.rows},"
+          f"{case.cols},{case.nnz}) dtype=int32 Q={case.queries} "
+          f"weighted={case.weighted} warmup={warmup} repeat={repeat}", flush=True)
+    for _ in range(warmup):
+        run()
+    torch.npu.synchronize(device)
+    if not native:
+        print(f"PERF_START {perf_name}", flush=True)
+    start = time.perf_counter()
+    for _ in range(repeat):
+        run()
+    torch.npu.synchronize(device)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    average_ms = elapsed_ms / repeat
+    if native:
+        print(f"NATIVE_END {perf_name} average_ms={average_ms:.6f}", flush=True)
+    else:
+        print(f"PERF_END {perf_name} total_ms={elapsed_ms:.6f} "
+              f"average_ms={average_ms:.6f}", flush=True)
+    return average_ms
+
+
+def _run_native_performance_case(perf_name, warmup, repeat):
+    return _run_performance_case(perf_name, warmup, repeat, native=True)
+
+
+def _general_configs(case):
+    return [(data, weighted, weight_dtype)
+            for data in ("none", "random")
+            for weighted, weight_dtype in ((False, torch.float32),
+                                           (True, torch.float32),
+                                           (True, torch.float64))]
+
+
+def _general_runner(case, dtype, device, config):
+    data, weighted, weight_dtype = config
+    custom = Case(case.name, case.rows, case.cols, case.nnz, case.queries,
+                  weighted, row_pattern=case.row_pattern)
+    values = make_inputs(custom, dtype, data, weight_dtype)
+    cpu, cpu_owners = make_runner(custom, values, "cpu", interface="graph")
+    run, owners = make_runner(custom, values, device, interface="graph")
+    exact_check(run(), cpu())
+    p, _, a = values[:3]
+    degree = p[1:].to(torch.int64) - p[:-1].to(torch.int64)
+    metadata = {"Q": case.queries, "weighted": weighted,
+                "weight_dtype": str(weight_dtype).split(".")[-1] if weighted else None,
+                "row_pattern": case.row_pattern, "data_pattern": data,
+                "with_data": bool(a.numel()), "seed": 20261115,
+                "input_sha256": hashlib.sha256(b"".join(t.numpy().tobytes() for t in values)).hexdigest(),
+                "nonempty_rows": int(degree.ne(0).sum()),
+                "max_degree": int(degree.max()) if degree.numel() else 0,
+                "adjacent_id_fraction": float((a[1:] - a[:-1]).abs().eq(1).float().mean())
+                if a.numel() > 1 else None}
+    return run, owners, metadata
+
+
+def _general_report(args):
+    # Keep the GENERAL_ENV/GENERAL_RESULT schema used by CSRToCOO.
+    libraries = sorted({line.split()[-1] for line in
+                        Path("/proc/self/maps").read_text().splitlines()
+                        if "libdgl.so" in line})
+    return {
+        "variant": args.general_variant,
+        "dgl_python": str(Path(dgl.__file__).resolve()),
+        "libraries": libraries,
+        "warmup": args.warmup, "repeat": args.repeat,
+        "measurements": args.measurements, "results": [],
+        "test_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "library_sha256": {p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+                           for p in libraries},
+        "python_files_sha256": {
+            name: hashlib.sha256((Path(dgl.__file__).parent / name).read_bytes()).hexdigest()
+            for name in ("_ffi/base.py", "_ffi/_ctypes/function.py",
+                         "heterograph_index.py", "backend/pytorch/tensor.py")
+        },
+    }
+
+
+def _run_generalization(args):
+    if not NPU_AVAILABLE:
+        raise RuntimeError("Ascend NPU is not available")
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    torch.set_num_threads(8)
+    cases = [c for c in GENERALIZATION_CASES
+             if args.general_case == "all" or c.name == args.general_case]
+    dtypes = ID_DTYPES if args.general_dtype == "all" else (
+        getattr(torch, args.general_dtype),)
+    report = _general_report(args)
+    args.general_output.parent.mkdir(parents=True, exist_ok=True)
+
+    def save():
+        args.general_output.write_text(json.dumps(report, indent=2) + "\n")
+
+    print("GENERAL_ENV", json.dumps({k: v for k, v in report.items()
+                                     if k != "results"}), flush=True)
+    save()
+    for case in cases:
+        for dtype in dtypes:
+            for config in _general_configs(case):
+                result = {"case": case.name, "dtype": str(dtype).split(".")[-1],
+                          "M": case.rows, "N": case.cols, "E": case.nnz}
+                try:
+                    run, owners, metadata = _general_runner(case, dtype, device, config)
+                    result.update(metadata)
+                    times = []
+                    for _ in range(args.measurements):
+                        for _ in range(args.warmup):
+                            run()
+                        torch.npu.synchronize(device)
+                        start = time.perf_counter()
+                        for _ in range(args.repeat):
+                            run()
+                        torch.npu.synchronize(device)
+                        times.append((time.perf_counter() - start) * 1000 / args.repeat)
+                    result.update(correct=True, round_ms=times,
+                                  mean_ms=sum(times) / len(times))
+                    del run, owners
+                    gc.collect()
+                except Exception as error:
+                    result.update(correct=False, error=repr(error))
+                    report["results"].append(result)
+                    save()
+                    raise
+                report["results"].append(result)
+                print("GENERAL_RESULT", json.dumps(result), flush=True)
+                save()
+
+
+def _run_msprof(
+    output_dir: Path, perf_cases: Sequence[str], warmup: int, repeat: int,
+    native: bool = False,
+) -> None:
+    msprof = shutil.which("msprof")
+    if msprof is None:
+        raise RuntimeError("msprof was not found in PATH")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve()
+    for perf_name in perf_cases:
+        case_output = output_dir / perf_name
+        command = [
+            msprof,
+            f"--output={case_output}",
+            "--ascendcl=on",
+            "--runtime-api=on",
+            "--task-time=l2",
+            "--ai-core=on",
+            "--aic-metrics=PipeUtilization",
+            sys.executable,
+            str(script),
+            "--native-performance" if native else "--performance",
+            "--perf-case",
+            perf_name,
+            "--warmup",
+            str(warmup),
+            "--repeat",
+            str(repeat),
+        ]
+        print("Running:", " ".join(command), flush=True)
+        subprocess.run(command, check=True)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--performance", action="store_true",
+                      help="Run NPU workloads, normally under msprof.")
+    mode.add_argument("--run-msprof", action="store_true",
+                      help="Launch one msprof process per requested performance case.")
+    mode.add_argument("--generalization", action="store_true",
+                      help="Audit additional shapes and distributions using existing helpers.")
+    mode.add_argument("--native-performance", action="store_true",
+                      help="Time the optional native CSR interface, separately from --performance.")
+    parser.add_argument("--perf-case", choices=("all", *PERFORMANCE_CASES), default="all")
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--measurements", type=int, default=3)
+    parser.add_argument("--general-case", default="all",
+                        choices=("all", *(c.name for c in GENERALIZATION_CASES)))
+    parser.add_argument("--general-dtype", default="all",
+                        choices=("all", "int32", "int64"))
+    parser.add_argument("--general-variant", default="optimized")
+    parser.add_argument("--general-output", type=Path)
+    parser.add_argument("--msprof-output", type=Path, default=Path("./msprof_csr_get_data"))
+    parser.add_argument("--msprof-interface", choices=("graph", "native"), default="graph")
+
+    args = parser.parse_args()
+    if args.warmup < 0 or args.repeat <= 0 or args.measurements <= 0:
+        parser.error("warmup must be >= 0; repeat and measurements must be > 0")
+    if args.generalization and args.general_output is None:
+        parser.error("--generalization requires --general-output")
+    return args
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    modes=parser.add_mutually_exclusive_group()
-    modes.add_argument("--performance",action="store_true")
-    modes.add_argument("--run-msprof",action="store_true")
-    modes.add_argument("--extended",action="store_true")
-    parser.add_argument("--perf-case",default="all",choices=("all",*CASES))
-    parser.add_argument("--warmup",type=int,default=20)
-    parser.add_argument("--repeat",type=int,default=100)
-    parser.add_argument("--rounds",type=int,default=3)
-    parser.add_argument("--output",type=Path)
-    parser.add_argument("--interface",choices=("graph","native","ffi"),default="graph")
-    parser.add_argument("--target-ratio",type=float,default=.8)
-    parser.add_argument("--msprof-output",type=Path,default=Path("/tmp/csr_get_data_prof"))
-    args=parser.parse_args()
-    if args.warmup<0 or args.repeat<1 or args.rounds<1 or args.target_ratio<=0:
-        parser.error("Invalid repetition counts or target ratio")
-    global INTERFACE,TARGET_RATIO
-    INTERFACE,TARGET_RATIO=args.interface,args.target_ratio
-    torch.npu.set_device(0)
-    cases=(list(PERF_CASES + EXTRA_CASES) if args.extended and args.perf_case=="all"
-           else list(PERF_CASES) if args.perf_case=="all" else [CASES[args.perf_case]])
-    if args.run_msprof:
-        for c in cases:
-            subprocess.run([shutil.which("msprof") or "msprof",f"--output={args.msprof_output/c.name}",
-                            "--ascendcl=on","--runtime-api=on","--task-time=l2","--ai-core=on",
-                            "--aic-metrics=PipeUtilization",sys.executable,str(Path(__file__).resolve()),
-                            "--performance","--perf-case",c.name,"--warmup",str(args.warmup),
-                            "--repeat",str(args.repeat),"--rounds",str(args.rounds),
-                            "--interface",args.interface,"--target-ratio",str(args.target_ratio)],check=True)
-    elif args.performance or args.extended:
-        library=Path(dgl._ffi.base._LIB._name).resolve()
-        report=dict(warmup=args.warmup,repeat=args.repeat,rounds=args.rounds,
-                    interface=INTERFACE,target_ratio=TARGET_RATIO,
-                    dgl_python=str(Path(dgl.__file__).resolve()),
-                    python_sha256={name:hashlib.sha256((Path(dgl.__file__).parent/name).read_bytes()).hexdigest()
-                                   for name in ("heterograph_index.py","_sparse_ops.py","_ffi/base.py")},
-                    test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                    library=str(library),library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),results=[])
-        for c in cases:
-            configs=([(torch.int32,"identity",c.weighted,torch.float32)] if not args.extended
-                     else [(idtype,data,weighted,wtype)
-                           for idtype in (torch.int32,torch.int64)
-                           for data in ("none","random")
-                           for weighted,wtype in ((False,torch.float32),
-                                                 (True,torch.float32),(True,torch.float64))])
-            for idtype,data,weighted,wtype in configs:
-                custom=(Case(c.name,c.rows,c.cols,c.nnz,c.queries,weighted,
-                             row_pattern=c.row_pattern) if args.extended else c)
-                report['results'].append(performance(custom,args.warmup,args.repeat,
-                                                     args.rounds,idtype,data,wtype))
-                if args.output:
-                    args.output.parent.mkdir(parents=True,exist_ok=True)
-                    args.output.write_text(json.dumps(report,indent=2)+'\n')
-    else:
-        suite=unittest.defaultTestLoader.loadTestsFromTestCase(TestCSRGetDataNPU)
-        result=unittest.TextTestRunner(verbosity=2).run(suite)
+    args = _parse_args()
+
+    if args.generalization:
+        _run_generalization(args)
+        return
+    selected_cases = (tuple(PERFORMANCE_CASES) if args.perf_case == "all"
+                      else (args.perf_case,))
+    if args.native_performance:
+        for name in selected_cases:
+            _run_native_performance_case(name, args.warmup, args.repeat)
+        return
+    if not args.performance and not args.run_msprof:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestCSRGetDataNPU)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
         raise SystemExit(0 if result.wasSuccessful() else 1)
+    if args.run_msprof:
+        _run_msprof(args.msprof_output, selected_cases, args.warmup, args.repeat,
+                    native=args.msprof_interface == "native")
+    else:
+        for name in selected_cases:
+            _run_performance_case(name, args.warmup, args.repeat)
 
 
-if __name__=='__main__':main()
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,9 @@
-"""CSRTranspose correctness and full graph-API performance on Ascend NPU.
+"""CSRTranspose correctness and msprof performance tests on Ascend NPU.
 
     python tests/ascend/test_csr_transpose_npu.py
-    python tests/ascend/test_csr_transpose_npu.py --performance --repeat 100 --warmup 20
-    python tests/ascend/test_csr_transpose_npu.py --run-msprof --repeat 100 --warmup 20
+    python tests/ascend/test_csr_transpose_npu.py --performance --perf-case long_tail_no_data
+    python tests/ascend/test_csr_transpose_npu.py --run-msprof --msprof-output ./msprof_csr_transpose
+    python tests/ascend/test_csr_transpose_npu.py --generalization --general-output /tmp/csr_transpose_general.json
 
 Fresh CSR graphs prevent the cached CSC format from bypassing CSRTranspose.
 Generation, upload and graph construction are outside the timed region;
@@ -23,6 +24,7 @@ import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import dgl
 import torch
@@ -34,9 +36,18 @@ except ImportError:
 
 ETYPE = ("_U", "_E", "_V")
 DTYPES = (torch.int32, torch.int64)
-NPU_AVAILABLE = torch_npu is not None and torch.npu.is_available()
 LARGE_INT64 = False
 _STAGE_RUNTIME = None
+
+
+def _npu_is_available() -> bool:
+    try:
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except RuntimeError:
+        return False
+
+
+NPU_AVAILABLE = _npu_is_available()
 
 
 @dataclass(frozen=True)
@@ -51,7 +62,7 @@ class Case:
     a100_ms: float | None = None
 
 
-PERFORMANCE_CASES = (
+PERF_CASES = (
     Case("long_tail_no_data", 10000, 10000, 500000, False,
          "long_tail", a100_ms=2.656580),
     Case("long_tail_with_data", 10000, 10000, 500000, True,
@@ -78,7 +89,10 @@ EXTRA_CASES = (
     Case("empty_bands", 257, 40001, 8193, False, cols_kind="last"),
     Case("first_column", 257, 20003, 8193, True, cols_kind="first"),
 )
-CASES = {case.name: case for case in PERFORMANCE_CASES + EXTRA_CASES}
+CASES = {case.name: case for case in PERF_CASES + EXTRA_CASES}
+GENERALIZATION_CASES = PERF_CASES + EXTRA_CASES
+ID_DTYPES = DTYPES
+PERFORMANCE_CASES = {case.name: case for case in PERF_CASES}
 
 
 def balanced(rows, nnz):
@@ -298,7 +312,7 @@ class TestCSRTransposeNPU(unittest.TestCase):
     @unittest.skipUnless(NPU_AVAILABLE, "Ascend NPU is required")
     def test_functional_matrix(self):
         torch.npu.set_device(0)
-        for case in PERFORMANCE_CASES + EXTRA_CASES:
+        for case in PERF_CASES + EXTRA_CASES:
             for dtype in DTYPES:
                 with self.subTest(case=case.name, dtype=dtype):
                     csr = make_csr(case, dtype)
@@ -357,80 +371,205 @@ class TestCSRTransposeNPU(unittest.TestCase):
             assert_result(case, dtype, actual, expected)
 
 
-def performance(name, warmup, repeat):
+def _run_performance_case(perf_name, warmup, repeat):
+    """Fresh graphs ensure every measured call executes CSRTranspose."""
     if not NPU_AVAILABLE:
         raise RuntimeError("Ascend NPU is not available")
-    case = CASES[name]
+    case = CASES[perf_name]
     dtype, device = torch.int32, torch.device("npu:0")
     torch.npu.set_device(device)
     csr = make_csr(case, dtype)
-    digest = hashlib.sha256(b"".join(x.numpy().tobytes() for x in csr)).hexdigest()
     graphs = [make_graph(case, csr, dtype, device) for _ in range(warmup + repeat)]
-    print(f"PERF_CONFIG name={name} shape=({case.rows},{case.cols},{case.nnz}) "
-          f"dtype=int32 with_data={case.with_data} warmup={warmup} repeat={repeat} "
-          f"input_sha256={digest}", flush=True)
-    for graph in graphs[:warmup]:
-        transpose(graph)
+    print(f"PERF_CONFIG name={perf_name} shape=({case.rows},"
+          f"{case.cols},{case.nnz}) dtype=int32 with_data={case.with_data} "
+          f"warmup={warmup} repeat={repeat}", flush=True)
+    for i in range(warmup):
+        transpose(graphs[i])
     torch.npu.synchronize(device)
+    print(f"PERF_START {perf_name}", flush=True)
     start = time.perf_counter()
     for i in range(repeat):
         transpose(graphs[warmup + i])
     torch.npu.synchronize(device)
-    average_ms = (time.perf_counter() - start) * 1000 / repeat
-    print(f"PERF_END {name} average_ms={average_ms:.6f}", flush=True)
-    return dict(case=name, M=case.rows, N=case.cols, E=case.nnz,
-                with_data=case.with_data, input_sha256=digest,
-                npu_ms=average_ms, a100_ms=case.a100_ms,
-                a100_over_npu=case.a100_ms / average_ms if case.a100_ms else None,
-                limit_ms=case.a100_ms / .3 if case.a100_ms else None,
-                passes_03=average_ms <= case.a100_ms / .3 if case.a100_ms else None)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    average_ms = elapsed_ms / repeat
+    print(f"PERF_END {perf_name} total_ms={elapsed_ms:.6f} "
+          f"average_ms={average_ms:.6f}", flush=True)
+    return average_ms
+
+
+def _general_report(args):
+    # Keep the GENERAL_ENV/GENERAL_RESULT schema used by CSRToCOO.
+    libraries = sorted({line.split()[-1] for line in
+                        Path("/proc/self/maps").read_text().splitlines()
+                        if "libdgl.so" in line})
+    return {
+        "variant": args.general_variant,
+        "dgl_python": str(Path(dgl.__file__).resolve()),
+        "libraries": libraries,
+        "warmup": args.warmup, "repeat": args.repeat,
+        "measurements": args.measurements, "results": [],
+        "test_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "library_sha256": {p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+                           for p in libraries},
+        "python_files_sha256": {
+            name: hashlib.sha256((Path(dgl.__file__).parent / name).read_bytes()).hexdigest()
+            for name in ("_ffi/base.py", "_ffi/_ctypes/function.py",
+                         "heterograph_index.py", "backend/pytorch/tensor.py")
+        },
+    }
+
+
+def _run_generalization(args):
+    if not NPU_AVAILABLE:
+        raise RuntimeError("Ascend NPU is not available")
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    torch.set_num_threads(8)
+    cases = [c for c in GENERALIZATION_CASES
+             if args.general_case == "all" or c.name == args.general_case]
+    dtypes = ID_DTYPES if args.general_dtype == "all" else (
+        getattr(torch, args.general_dtype),)
+    report = _general_report(args)
+    args.general_output.parent.mkdir(parents=True, exist_ok=True)
+
+    def save():
+        args.general_output.write_text(json.dumps(report, indent=2) + "\n")
+
+    print("GENERAL_ENV", json.dumps({k: v for k, v in report.items()
+                                     if k != "results"}), flush=True)
+    save()
+    for case in cases:
+        for dtype in dtypes:
+            csr = make_csr(case, dtype)
+            p, _, a = csr
+            degree = p[1:].to(torch.int64) - p[:-1].to(torch.int64)
+            result = {"case": case.name, "dtype": str(dtype).split(".")[-1],
+                      "M": case.rows, "N": case.cols, "E": case.nnz,
+                      "row_pattern": case.rows_kind,
+                      "data_pattern": "reverse" if case.with_data else "none",
+                      "with_data": case.with_data, "seed": None,
+                      "input_sha256": hashlib.sha256(b"".join(t.numpy().tobytes() for t in csr)).hexdigest(),
+                      "nonempty_rows": int(degree.ne(0).sum()),
+                      "max_degree": int(degree.max()) if degree.numel() else 0,
+                      "adjacent_id_fraction": float((a[1:] - a[:-1]).abs().eq(1).float().mean())
+                      if a.numel() > 1 else None}
+            try:
+                cpu = make_graph(case, csr, dtype, torch.device("cpu"))
+                check = make_graph(case, csr, dtype, device)
+                assert_result(case, dtype, transpose(check), transpose(cpu))
+                del cpu, check
+                times = []
+                for _ in range(args.measurements):
+                    graphs = [make_graph(case, csr, dtype, device)
+                              for _ in range(args.warmup + args.repeat)]
+                    for i in range(args.warmup):
+                        transpose(graphs[i])
+                    torch.npu.synchronize(device)
+                    start = time.perf_counter()
+                    for i in range(args.repeat):
+                        transpose(graphs[args.warmup + i])
+                    torch.npu.synchronize(device)
+                    times.append((time.perf_counter() - start) * 1000 / args.repeat)
+                    del graphs
+                    gc.collect()
+                result.update(correct=True, round_ms=times,
+                              mean_ms=sum(times) / len(times))
+            except Exception as error:
+                result.update(correct=False, error=repr(error))
+                report["results"].append(result)
+                save()
+                raise
+            report["results"].append(result)
+            print("GENERAL_RESULT", json.dumps(result), flush=True)
+            save()
+
+
+def _run_msprof(
+    output_dir: Path, perf_cases: Sequence[str], warmup: int, repeat: int,
+    native: bool = False,
+) -> None:
+    msprof = shutil.which("msprof")
+    if msprof is None:
+        raise RuntimeError("msprof was not found in PATH")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve()
+    for perf_name in perf_cases:
+        case_output = output_dir / perf_name
+        command = [
+            msprof,
+            f"--output={case_output}",
+            "--ascendcl=on",
+            "--runtime-api=on",
+            "--task-time=l2",
+            "--ai-core=on",
+            "--aic-metrics=PipeUtilization",
+            sys.executable,
+            str(script),
+            "--native-performance" if native else "--performance",
+            "--perf-case",
+            perf_name,
+            "--warmup",
+            str(warmup),
+            "--repeat",
+            str(repeat),
+        ]
+        print("Running:", " ".join(command), flush=True)
+        subprocess.run(command, check=True)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--performance", action="store_true",
+                      help="Run NPU workloads, normally under msprof.")
+    mode.add_argument("--run-msprof", action="store_true",
+                      help="Launch one msprof process per requested performance case.")
+    mode.add_argument("--generalization", action="store_true",
+                      help="Audit additional shapes and distributions using existing helpers.")
+
+    parser.add_argument("--perf-case", choices=("all", *PERFORMANCE_CASES), default="all")
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--measurements", type=int, default=3)
+    parser.add_argument("--general-case", default="all",
+                        choices=("all", *(c.name for c in GENERALIZATION_CASES)))
+    parser.add_argument("--general-dtype", default="all",
+                        choices=("all", "int32", "int64"))
+    parser.add_argument("--general-variant", default="optimized")
+    parser.add_argument("--general-output", type=Path)
+    parser.add_argument("--msprof-output", type=Path, default=Path("./msprof_csr_transpose"))
+
+    parser.add_argument("--large-int64", action="store_true",
+                        help="Run real >uint32 dimensions (uses 32 GiB NPU memory)")
+    args = parser.parse_args()
+    if args.warmup < 0 or args.repeat <= 0 or args.measurements <= 0:
+        parser.error("warmup must be >= 0; repeat and measurements must be > 0")
+    if args.generalization and args.general_output is None:
+        parser.error("--generalization requires --general-output")
+    return args
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--performance", action="store_true")
-    mode.add_argument("--run-msprof", action="store_true")
-    parser.add_argument("--perf-case", default="all",
-                        choices=("all", *CASES))
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--large-int64",action="store_true",
-                        help="Run a real >uint32 dimension test (uses 32 GiB NPU memory)")
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--msprof-output", type=Path, default=Path("/tmp/csr_transpose_msprof"))
-    args = parser.parse_args()
+    args = _parse_args()
     global LARGE_INT64
-    LARGE_INT64=args.large_int64
-    if args.warmup < 0 or args.repeat < 1:
-        parser.error("warmup must be >= 0 and repeat must be > 0")
-    cases = ([c.name for c in PERFORMANCE_CASES] if args.perf_case == "all"
-             else [args.perf_case])
-    if args.run_msprof:
-        executable = shutil.which("msprof")
-        if not executable:
-            raise RuntimeError("msprof is not in PATH")
-        for name in cases:
-            subprocess.run([executable, f"--output={args.msprof_output / name}",
-                            "--ascendcl=on", "--runtime-api=on", "--task-time=l2",
-                            "--ai-core=on", "--aic-metrics=PipeUtilization",
-                            sys.executable, str(Path(__file__).resolve()),
-                            "--performance", "--perf-case", name,
-                            "--warmup", str(args.warmup), "--repeat", str(args.repeat)],
-                           check=True)
-    elif args.performance:
-        report = dict(warmup=args.warmup, repeat=args.repeat,
-                      test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                      dgl_python=str(Path(dgl.__file__).resolve()), results=[])
-        for name in cases:
-            report["results"].append(performance(name, args.warmup, args.repeat))
-            if args.output:
-                args.output.parent.mkdir(parents=True, exist_ok=True)
-                args.output.write_text(json.dumps(report, indent=2) + "\n")
-    else:
+    LARGE_INT64 = args.large_int64
+    if args.generalization:
+        _run_generalization(args)
+        return
+    selected_cases = (tuple(PERFORMANCE_CASES) if args.perf_case == "all"
+                      else (args.perf_case,))
+
+    if not args.performance and not args.run_msprof:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestCSRTransposeNPU)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         raise SystemExit(0 if result.wasSuccessful() else 1)
+    if args.run_msprof:
+        _run_msprof(args.msprof_output, selected_cases, args.warmup, args.repeat)
+    else:
+        for name in selected_cases:
+            _run_performance_case(name, args.warmup, args.repeat)
 
 
 if __name__ == "__main__":
