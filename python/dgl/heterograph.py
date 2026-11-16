@@ -3247,6 +3247,20 @@ class DGLGraph(object):
         )
         srctype, _, dsttype = self.to_canonical_etype(etype)
         u = utils.prepare_tensor(self, u, "u")
+        # CSRGetDataAndIndices validates every consumed NPU query itself.
+        # Avoid the legacy HasVertices compare and duplicate device reductions.
+        if (return_uv and F.backend_name == "pytorch"
+                and F.device_type(F.context(u)) == "npu"):
+            v = utils.prepare_tensor(self, v, "v")
+            if not len(u) or not len(v):
+                # Empty broadcasting consumes no queries, so validate the
+                # remaining IDs here to preserve the public API's checks.
+                for ids, ntype, name in ((u, srctype, "u"), (v, dsttype, "v")):
+                    if len(ids) and F.as_scalar(F.min(ids, 0)) < 0:
+                        raise DGLError("All IDs must be non-negative integers.")
+                    if len(ids) and F.as_scalar(F.max(ids, 0)) >= self.num_nodes(ntype):
+                        raise DGLError("{} contains invalid node IDs".format(name))
+            return self._graph.edge_ids_all(self.get_etype_id(etype), u, v)
         if F.as_scalar(F.sum(self.has_nodes(u, ntype=srctype), dim=0)) != len(
             u
         ):

@@ -727,23 +727,14 @@ std::vector<NDArray> CSRGetDataAndIndices(
   CHECK_SAME_DTYPE(csr.indices, cols);
   CHECK_SAME_CONTEXT(rows, cols);
   std::vector<NDArray> ret;
+#ifdef DGL_USE_ASCEND
   if (rows->ctx.device_type == kDGLAscend) {
-    DGLContext cpu_ctx{kDGLCPU, 0};
-    auto csr_indptr = csr.indptr.CopyTo(cpu_ctx);
-    auto csr_indices = csr.indices.CopyTo(cpu_ctx);
-    auto csr_data = csr.data.CopyTo(cpu_ctx);
-    auto rows_cpu = rows.CopyTo(cpu_ctx);
-    auto cols_cpu = cols.CopyTo(cpu_ctx);
-    CSRMatrix csr_cpu{csr.num_rows, csr.num_cols,
-                       csr_indptr, csr_indices, csr_data};
     ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
-      ret = impl::CSRGetDataAndIndices<kDGLCPU, IdType>(
-          csr_cpu, rows_cpu, cols_cpu);
+      ret = impl::CSRGetDataAndIndices<kDGLAscend, IdType>(csr, rows, cols);
     });
-    for (auto& arr : ret) {
-      arr = arr.CopyTo(rows->ctx);
-    }
-  } else {
+  } else
+#endif
+  {
     ATEN_CSR_SWITCH_CUDA_UVA(csr, rows, XPU, IdType, "CSRGetDataAndIndices", {
       ret = impl::CSRGetDataAndIndices<XPU, IdType>(csr, rows, cols);
     });
